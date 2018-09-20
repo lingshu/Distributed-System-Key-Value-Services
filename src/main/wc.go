@@ -1,6 +1,11 @@
 package main
 
-import "os"
+import (
+  "os"
+  "strconv"
+  "strings"
+  "unicode"
+)
 import "fmt"
 import "mapreduce"
 import "container/list"
@@ -9,10 +14,19 @@ import "container/list"
 // key to the Map function, as in the paper; only a value,
 // which is a part of the input file contents
 func Map(value string) *list.List {
+  res := list.New()
+  words := strings.FieldsFunc(value, func(r rune) bool {
+    return !unicode.IsLetter(r)
+  })
+  for _, word := range words {
+    res.PushBack(mapreduce.KeyValue{word, "1"})
+  }
+  return res
 }
 
 // iterate over list and add values
 func Reduce(key string, values *list.List) string {
+  return strconv.Itoa(values.Len())
 }
 
 // Can be run in 3 ways:
