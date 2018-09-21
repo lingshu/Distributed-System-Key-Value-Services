@@ -78,6 +78,7 @@ func InitMapReduce(nmap int, nreduce int,
   mr.DoneChannel = make(chan bool)
 
   // initialize any additional state here
+  mr.Workers = make(map[string]*WorkerInfo)
   return mr
 }
 
@@ -124,7 +125,7 @@ func (mr *MapReduce) StartRegistrationServer() {
           conn.Close()
         }()
       } else {
-        DPrintf("RegistrationServer: accept error", err)
+        DPrintf("RegistrationServer: accept error %s", err)
         break
       }
     }
