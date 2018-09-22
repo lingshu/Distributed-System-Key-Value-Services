@@ -133,34 +133,34 @@ func cleanup(mr *MapReduce) {
 }
 
 func TestBasic(t *testing.T) {
-  fmt.Printf("Test: Basic mapreduce ...\n")
-  mr := setup()
-  for i := 0; i < 2; i++ {
-    go RunWorker(mr.MasterAddress, port("worker" + strconv.Itoa(i)),
-                 MapFunc, ReduceFunc, -1)
-  }
-  // Wait until MR is done
-  <- mr.DoneChannel
-  check(t, mr.file)
-  checkWorker(t, mr.stats)
-  cleanup(mr)
-  fmt.Printf("  ... Basic Passed\n")
+ fmt.Printf("Test: Basic mapreduce ...\n")
+ mr := setup()
+ for i := 0; i < 2; i++ {
+   go RunWorker(mr.MasterAddress, port("worker" + strconv.Itoa(i)),
+                MapFunc, ReduceFunc, -1)
+ }
+ // Wait until MR is done
+ <- mr.DoneChannel
+ check(t, mr.file)
+ checkWorker(t, mr.stats)
+ cleanup(mr)
+ fmt.Printf("  ... Basic Passed\n")
 }
 
 func TestOneFailure(t *testing.T) {
-  fmt.Printf("Test: One Failure mapreduce ...\n")
-  mr := setup()
-  // Start 2 workers that fail after 10 jobs
-  go RunWorker(mr.MasterAddress, port("worker" + strconv.Itoa(0)),
-               MapFunc, ReduceFunc, 10)
-  go RunWorker(mr.MasterAddress, port("worker" + strconv.Itoa(1)),
-               MapFunc, ReduceFunc, -1)
-  // Wait until MR is done
-  <- mr.DoneChannel
-  check(t, mr.file)
-  checkWorker(t, mr.stats)
-  cleanup(mr)
-  fmt.Printf("  ... One Failure Passed\n")
+ fmt.Printf("Test: One Failure mapreduce ...\n")
+ mr := setup()
+ // Start 2 workers that fail after 10 jobs
+ go RunWorker(mr.MasterAddress, port("worker" + strconv.Itoa(0)),
+              MapFunc, ReduceFunc, 10)
+ go RunWorker(mr.MasterAddress, port("worker" + strconv.Itoa(1)),
+              MapFunc, ReduceFunc, -1)
+ // Wait until MR is done
+ <- mr.DoneChannel
+ check(t, mr.file)
+ checkWorker(t, mr.stats)
+ cleanup(mr)
+ fmt.Printf("  ... One Failure Passed\n")
 }
 
 func TestManyFailures(t *testing.T) {

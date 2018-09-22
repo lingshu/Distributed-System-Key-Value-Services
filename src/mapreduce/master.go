@@ -10,10 +10,10 @@ import "fmt"
 
 type WorkerInfo struct {
   address string
-  inUse bool
+  state int
   // You can add definitions here.
 }
-func (mr *MapReduce) assignJob(workerInfo *WorkerInfo, JobNum int, comJob *int, job JobType, lock *sync.Mutex) {
+func (mr *MapReduce) assignJob(workerInfo *WorkerInfo, jobId int, comJob *int, job JobType, lock *sync.Mutex) (bool) {
   var numOtherPhase int
   if job == Map {
     numOtherPhase = mr.nReduce
@@ -21,26 +21,28 @@ func (mr *MapReduce) assignJob(workerInfo *WorkerInfo, JobNum int, comJob *int, 
     numOtherPhase = mr.nMap
   }
 
-  jobArgs := &DoJobArgs{mr.file, job, JobNum, numOtherPhase}
+  jobArgs := &DoJobArgs{mr.file, job, jobId, numOtherPhase}
 
   var jobReply DoJobReply
   ok := call(workerInfo.address, "Worker.DoJob", jobArgs, &jobReply)
   if ok == false {
-    fmt.Printf("call Worker.DoJob %d error", JobNum)
+    fmt.Printf("call Worker.DoJob %d error", jobId)
+    workerInfo.state = 2
+    log.Printf("work failed")
+    return false
   } else {
-    workerInfo.inUse = false
+    workerInfo.state = 0
     lock.Lock()
     *comJob++
     lock.Unlock()
+    return true
   }
 }
 
 func (mr *MapReduce) scheduleMap(workerInfo *WorkerInfo, comLock *sync.Mutex) {
   log.Printf("starting map jobs")
 
-
-  workId := 0
-  comJob := 0
+  workId, comJobNum := 0, 0
   for {
     if workId >= mr.nMap {
       log.Printf("all map tasks sent out")
@@ -48,22 +50,31 @@ func (mr *MapReduce) scheduleMap(workerInfo *WorkerInfo, comLock *sync.Mutex) {
     }
 
     workerInfo = nil
+    comLock.Lock()
     for _, workerInfo = range mr.Workers {
-      if workerInfo.inUse == false {
+      if workerInfo.state == 0 {
         break
       }
     }
+    comLock.Unlock()
 
-    if workerInfo != nil && workerInfo.inUse == false {
-      workerInfo.inUse = true
-      go mr.assignJob(workerInfo, workId , &comJob, Map, comLock)
+    fmt.Printf("hello\n")
 
-      workId++
+    if workerInfo != nil && workerInfo.state == 0 {
+      workerInfo.state = 1
+      fmt.Printf("helloagain\n")
+      if mr.assignJob(workerInfo, workId , &comJobNum, Map, comLock) == true {
+        fmt.Printf("helloworld\n")
+        comLock.Lock()
+        workId++
+        comLock.Unlock()
+      }
     }
+
   }
 
   for {
-    if comJob >= mr.nMap {
+    if comJobNum >= mr.nMap {
       break
     }
     time.Sleep(time.Duration(1) * time.Second)
@@ -75,29 +86,36 @@ func (mr *MapReduce) scheduleMap(workerInfo *WorkerInfo, comLock *sync.Mutex) {
 func (mr *MapReduce) scheduleReduce(workerInfo *WorkerInfo, lock *sync.Mutex) {
   log.Printf("starting reduce jobs")
 
-  workId := 0
-  comJob := 0
+  workId, comJobNum := 0, 0
   for {
     if workId >= mr.nReduce {
       log.Printf("all reduce tasks sent out")
       break
     }
 
+    lock.Lock()
     for _, workerInfo = range mr.Workers {
-      if workerInfo.inUse == false {
+      if workerInfo.state == 0 {
         break
       }
     }
+    lock.Unlock()
 
-    if workerInfo != nil && workerInfo.inUse == false {
-      workerInfo.inUse = true
-      go mr.assignJob(workerInfo, workId, &comJob, Reduce, lock)
-      workId++
+    fmt.Printf("hello\n")
+
+    if workerInfo != nil && workerInfo.state == 0 {
+      workerInfo.state = 1
+      fmt.Printf("helloagain\n")
+      if mr.assignJob(workerInfo, workId, &comJobNum, Reduce, lock) == true {
+        lock.Lock()
+        workId++
+        lock.Unlock()
+      }
     }
   }
 
   for {
-    if comJob >= mr.nReduce {
+    if comJobNum >= mr.nReduce {
       break
     }
     time.Sleep(time.Duration(1) * time.Second)
@@ -127,28 +145,28 @@ func (mr *MapReduce) KillWorkers() *list.List {
 func (mr *MapReduce) RunMaster() *list.List {
   log.Printf("starting RunMaster")
   // Your code here
-  workerAddr := <- mr.registerChannel
-  _, ok := mr.Workers[workerAddr]
-  if !ok {
-    workerInfo := new(WorkerInfo)
-    workerInfo.address = workerAddr
-    workerInfo.inUse = false
-    mr.Workers[workerAddr] = workerInfo
-  }
-
-  workerAddr = <- mr.registerChannel
-  _, ok = mr.Workers[workerAddr]
-  if !ok {
-    workerInfo := new(WorkerInfo)
-    workerInfo.address = workerAddr
-    workerInfo.inUse = false
-    mr.Workers[workerAddr] = workerInfo
-  }
+  lock := new(sync.Mutex)
+  go func() {
+    for {
+      workerAddr := <- mr.registerChannel
+      lock.Lock()
+      _, ok := mr.Workers[workerAddr]
+      if !ok {
+       workerInfo := new(WorkerInfo)
+       workerInfo.address = workerAddr
+       workerInfo.state = 0
+       mr.Workers[workerAddr] = workerInfo
+      } else {
+        mr.Workers[workerAddr].address = workerAddr
+        mr.Workers[workerAddr].state = 0
+      }
+      lock.Unlock()
+    }
+  }()
 
   var workerInfo *WorkerInfo
-  comLock := new(sync.Mutex)
 
-  mr.scheduleMap(workerInfo, comLock)
-  mr.scheduleReduce(workerInfo, comLock)
+  mr.scheduleMap(workerInfo, lock)
+  mr.scheduleReduce(workerInfo, lock)
   return mr.KillWorkers()
 }
