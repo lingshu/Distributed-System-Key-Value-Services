@@ -1,8 +1,18 @@
 package pbservice
 
-import "viewservice"
+import (
+  "log"
+  "math/big"
+  "strconv"
+  "time"
+
+  //"math/rand"
+  "crypto/rand"
+  "viewservice"
+)
 import "net/rpc"
 import "fmt"
+
 
 // You'll probably need to uncomment these:
 // import "time"
@@ -14,6 +24,8 @@ import "fmt"
 type Clerk struct {
   vs *viewservice.Clerk
   // Your declarations here
+  me string
+  view viewservice.View
 }
 
 
@@ -21,6 +33,8 @@ func MakeClerk(vshost string, me string) *Clerk {
   ck := new(Clerk)
   ck.vs = viewservice.MakeClerk(me, vshost)
   // Your ck.* initializations here
+  ck.me = me
+  ck.view = viewservice.View{0, "", ""}
 
   return ck
 }
@@ -69,10 +83,50 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
   // Your code here.
+  args_get := &GetArgs{key}
+  var reply_get GetReply
+  ok := false
+  for !ok {
+   ok = call(ck.view.Primary, "PBServer.Get", args_get, &reply_get)
+   if !ok || reply_get.Err == ErrWrongServer {
+     time.Sleep(viewservice.PingInterval)
+     v, err := ck.vs.Ping(ck.view.Viewnum)
+     if err != nil {
+       continue
+     }
+     ck.view = v
+     ok = false
+   }
+  }
 
-  return "???"
+  return reply_get.Value
+  //args := &GetArgs{key}
+  //var reply GetReply
+  //ok := false
+  //
+  //for !ok {
+  //  ok = call(ck.view.Primary, "PBServer.Get", args, &reply)
+  //  if !ok || reply.Err == ErrWrongServer {
+  //    time.Sleep(viewservice.PingInterval)
+  //    view, err := ck.vs.Ping(ck.view.Viewnum)
+  //    if err != nil {
+  //      //log.Printf("Client %s get view from viewservice failed\n", ck.me)
+  //      continue
+  //    }
+  //    ck.view = view
+  //    ok = false
+  //  }
+  //}
+  //
+  //return reply.Value
 }
 
+func nrand() int64 {
+  max := big.NewInt(int64(1) << 62)
+  bigx, _ := rand.Int(rand.Reader, max)
+  x := bigx.Int64()
+  return x
+}
 //
 // tell the primary to update key's value.
 // must keep trying until it succeeds.
@@ -80,10 +134,55 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 
   // Your code here.
+  args_put := &PutArgs{key, value, dohash, strconv.FormatInt(nrand(), 10), ck.me}
+  var reply_put PutReply
+  for ok := false; !ok; {
+    ok = call(ck.view.Primary, "PBServer.Put", args_put, &reply_put)
+    if !ok || reply_put.Err == ErrWrongServer {
+      time.Sleep(viewservice.PingInterval)
+      v, err := ck.vs.Ping(ck.view.Viewnum)
+      if err != nil {
+        log.Printf("Client %s ping viewservice failed\n", ck.me)
+        continue
+      }
+      ck.view = v
+      ok = false
+    } else {
+      if reply_put.Err == ErrDuplicateKey {
+        return reply_put.PreviousValue
+      } else if !dohash {
+        if reply_put.Err == OK {
+          return ""
+        }
+      } else {
+        if reply_put.Err == OK {
+          return reply_put.PreviousValue
+        }
+      }
+    }
+    time.Sleep(3*viewservice.PingInterval)
+  }
+  //args := &PutArgs{key, value, dohash, strconv.FormatInt(nrand(), 10), ck.me}
+  //var reply PutReply
+  //
+  //for ok := false; !ok; {
+  //  ok = call(ck.view.Primary, "PBServer.PutAppend", args, &reply)
+  //  if !ok || reply.Err == ErrWrongServer {
+  //    time.Sleep(viewservice.PingInterval)
+  //    view, err := ck.vs.Ping(ck.view.Viewnum)
+  //    if err != nil {
+  //      log.Printf("Client %s get view from viewservice failed\n", ck.me)
+  //      continue
+  //    }
+  //    ck.view = view
+  //    ok = false
+  //  }
+  //}
   return "???"
 }
 
 func (ck *Clerk) Put(key string, value string) {
+  //DPrintf("Clerk.Put .... client sends put with key %s and value %s\n", key, value)
   ck.PutExt(key, value, false)
 }
 func (ck *Clerk) PutHash(key string, value string) string {

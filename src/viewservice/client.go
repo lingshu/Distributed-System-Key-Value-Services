@@ -10,12 +10,14 @@ import "fmt"
 type Clerk struct {
   me string      // client's name (host:port)
   server string  // viewservice's host:port
+  //last uint //the viewNum last pinged
 }
 
 func MakeClerk(me string, server string) *Clerk {
   ck := new(Clerk)
   ck.me = me
   ck.server = server
+  //ck.last = 0
   return ck
 }
 
@@ -57,6 +59,7 @@ func (ck *Clerk) Ping(viewnum uint) (View, error) {
   args := &PingArgs{}
   args.Me = ck.me
   args.Viewnum = viewnum
+  //args.last = ck.last
   var reply PingReply
 
   // send an RPC request, wait for the reply.

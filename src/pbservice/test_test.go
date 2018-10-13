@@ -89,6 +89,7 @@ func TestBasicFail(t *testing.T) {
   ck.Put("4", "44")
   check(ck, "4", "44")
 
+
   fmt.Printf("  ... Passed\n")
 
   // kill the primary
