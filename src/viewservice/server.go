@@ -18,14 +18,20 @@ type ViewServer struct {
 
   // Your declarations here.
   //m map[string]time.Time
-  view View
-  ack bool
-  idle string
-  count_primary int
-  count_backup int
-  dead_primary bool
-  dead_backup bool
-  backup_ready bool
+  //view View
+  //ack bool
+  //idle string
+  //count_primary int
+  //count_backup int
+  //dead_primary bool
+  //dead_backup bool
+  //backup_ready bool
+  view        View
+  primaryAck  uint
+  backupAck   uint
+  primaryTick uint
+  backupTick  uint
+  currentTick uint
 }
 
 //
@@ -37,39 +43,78 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
   vs.mu.Lock()
   defer vs.mu.Unlock()
 
-  if (vs.view.Viewnum == 0) {
-   vs.view.Viewnum = 1
-   vs.view.Primary = args.Me
-   vs.ack = false
-  }
+  //if (vs.view.Viewnum == 0) {
+  // vs.view.Viewnum = 1
+  // vs.view.Primary = args.Me
+  // vs.ack = false
+  //}
+  //
+  //if (vs.view.Primary == args.Me) {
+  //  vs.count_primary = 0
+  //  if (args.Viewnum == 0 && vs.view.Viewnum != 1) {
+  //    vs.dead_primary = true
+  //  } else if (args.Viewnum == vs.view.Viewnum && vs.ack == false) {
+  //    vs.ack = true
+  //  }
+  //}
+  //
+  //if (vs.view.Backup == args.Me) {
+  //  vs.count_backup = 0
+  //  //fmt.Printf("%v\n", args.last)
+  //  if (args.Viewnum == 0) {
+  //    //args.last = args.Viewnum
+  //    vs.backup_ready = false
+  //    //vs.dead_backup = true
+  //  } else if (args.Viewnum == vs.view.Viewnum) {
+  //    //args.last = args.Viewnum
+  //    vs.backup_ready = true
+  //  }
+  //}
+  //
+  //if (vs.view.Primary != args.Me && vs.view.Backup != args.Me) {
+  //  vs.idle = args.Me
+  //}
+  //
+  //reply.View = vs.view
+  //return nil
+  Viewnum := args.Viewnum
+  ck := args.Me
 
-  if (vs.view.Primary == args.Me) {
-    vs.count_primary = 0
-    if (args.Viewnum == 0 && vs.view.Viewnum != 1) {
-      vs.dead_primary = true
-    } else if (args.Viewnum == vs.view.Viewnum && vs.ack == false) {
-      vs.ack = true
+
+  switch {
+
+  case vs.view.Primary == "" && vs.view.Viewnum == 0:
+    vs.view.Primary = ck
+    vs.view.Viewnum = Viewnum + 1
+    vs.primaryAck = 0
+    vs.primaryTick = vs.currentTick
+
+  case vs.view.Primary == ck:
+    if Viewnum == 0 {
+      vs.PromoteBackup()
+    } else {
+      vs.primaryAck = Viewnum
+      vs.primaryTick = vs.currentTick
     }
-  }
 
-  if (vs.view.Backup == args.Me) {
-    vs.count_backup = 0
-    //fmt.Printf("%v\n", args.last)
-    if (args.Viewnum == 0) {
-      //args.last = args.Viewnum
-      vs.backup_ready = false
-      //vs.dead_backup = true
-    } else if (args.Viewnum == vs.view.Viewnum) {
-      //args.last = args.Viewnum
-      vs.backup_ready = true
+  case vs.view.Backup == "" && vs.view.Viewnum == vs.primaryAck:
+    vs.view.Backup = ck
+    vs.view.Viewnum++
+    vs.backupTick = vs.currentTick
+
+  case vs.view.Backup == ck:
+    if Viewnum == 0 && vs.view.Viewnum == vs.primaryAck {
+      vs.view.Backup = ck
+      vs.view.Viewnum++
+      vs.backupTick = vs.currentTick
+    } else if Viewnum != 0 {
+      vs.backupTick = vs.currentTick
     }
-  }
-
-  if (vs.view.Primary != args.Me && vs.view.Backup != args.Me) {
-    vs.idle = args.Me
   }
 
   reply.View = vs.view
+
+
   return nil
 }
 
@@ -86,11 +131,21 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
   return nil
 }
 
-func (vs *ViewServer) changeView(new_primary string, new_backup string) {
-  vs.view = View{vs.view.Viewnum + 1, new_primary, new_backup}
-  vs.ack = false
-  vs.backup_ready = false
+func (vs *ViewServer) PromoteBackup() {
+  if vs.view.Backup != "" {
+    vs.view.Primary = vs.view.Backup
+    vs.view.Backup = ""
+    vs.view.Viewnum++
+    vs.primaryAck = vs.backupAck
+    vs.primaryTick = vs.backupTick
+  }
 }
+
+//func (vs *ViewServer) changeView(new_primary string, new_backup string) {
+//  vs.view = View{vs.view.Viewnum + 1, new_primary, new_backup}
+//  vs.ack = false
+//  vs.backup_ready = false
+//}
 //
 // tick() is called once per PingInterval; it should notice
 // if servers have died or recovered, and change the view
@@ -103,66 +158,75 @@ func (vs *ViewServer) tick() {
   defer vs.mu.Unlock()
 
   //check whether overtime
-  if vs.view.Primary != "" {
-    if vs.count_primary == DeadPings {
-      vs.count_primary = 0
-      vs.dead_primary = true
-    } else {
-      vs.count_primary += 1
-    }
+  //if vs.view.Primary != "" {
+  //  if vs.count_primary == DeadPings {
+  //    vs.count_primary = 0
+  //    vs.dead_primary = true
+  //  } else {
+  //    vs.count_primary += 1
+  //  }
+  //}
+  //
+  //if vs.view.Backup != "" {
+  //  if vs.count_backup == DeadPings {
+  //    vs.count_backup = 0
+  //    vs.dead_backup = true
+  //  } else {
+  //    vs.count_backup += 1
+  //  }
+  //}
+  //
+  //
+  ////if the server dead, change the current view
+  //if (vs.ack) {
+  //  isViewChanged := false
+  //  if vs.dead_primary {
+  //    vs.view.Primary = ""
+  //    if (vs.view.Backup != "" && vs.backup_ready) {
+  //      //vs.changeView(vs.view.Backup, vs.idle)
+  //      vs.view.Primary = vs.view.Backup
+  //      vs.view.Backup = ""
+  //      vs.dead_primary = false
+  //      //vs.ack = false
+  //      vs.backup_ready = false
+  //      //vs.view.Viewnum += 1
+  //      isViewChanged = true
+  //    }
+  //  }
+  //
+  //  if vs.dead_backup {
+  //    vs.view.Backup = ""
+  //    if (vs.idle != "") {
+  //      //vs.changeView(vs.view.Primary, vs.idle)
+  //      vs.view.Backup = vs.idle
+  //      vs.idle = ""
+  //      vs.dead_backup = false
+  //      vs.backup_ready = false
+  //      isViewChanged = true
+  //    }
+  //  }
+  //
+  //  if (vs.view.Backup == "" && vs.idle != "") {
+  //    vs.view.Backup = vs.idle
+  //    vs.idle = ""
+  //    isViewChanged = true
+  //    //vs.view.Viewnum += 1
+  //    //vs.ack = false
+  //  }
+  //
+  //  if isViewChanged {
+  //    vs.view.Viewnum += 1
+  //    vs.ack = false
+  //  }
+  //}
+  vs.currentTick++
+  if vs.currentTick-vs.primaryTick >= DeadPings && vs.view.Viewnum == vs.primaryAck {
+    vs.PromoteBackup()
   }
 
-  if vs.view.Backup != "" {
-    if vs.count_backup == DeadPings {
-      vs.count_backup = 0
-      vs.dead_backup = true
-    } else {
-      vs.count_backup += 1
-    }
-  }
-
-
-  //if the server dead, change the current view
-  if (vs.ack) {
-    isViewChanged := false
-    if vs.dead_primary {
-      vs.view.Primary = ""
-      if (vs.view.Backup != "" && vs.backup_ready) {
-        //vs.changeView(vs.view.Backup, vs.idle)
-        vs.view.Primary = vs.view.Backup
-        vs.view.Backup = ""
-        vs.dead_primary = false
-        //vs.ack = false
-        vs.backup_ready = false
-        //vs.view.Viewnum += 1
-        isViewChanged = true
-      }
-    }
-
-    if vs.dead_backup {
-      vs.view.Backup = ""
-      if (vs.idle != "") {
-        //vs.changeView(vs.view.Primary, vs.idle)
-        vs.view.Backup = vs.idle
-        vs.idle = ""
-        vs.dead_backup = false
-        vs.backup_ready = false
-        isViewChanged = true
-      }
-    }
-
-    if (vs.view.Backup == "" && vs.idle != "") {
-      vs.view.Backup = vs.idle
-      vs.idle = ""
-      isViewChanged = true
-      //vs.view.Viewnum += 1
-      //vs.ack = false
-    }
-
-    if isViewChanged {
-      vs.view.Viewnum += 1
-      vs.ack = false
-    }
+  if vs.view.Backup != "" && vs.currentTick-vs.backupTick >= DeadPings && vs.view.Viewnum == vs.primaryAck {
+    vs.view.Backup = ""
+    vs.view.Viewnum++
   }
 }
 
@@ -181,11 +245,16 @@ func StartServer(me string) *ViewServer {
   vs.me = me
   // Your vs.* initializations here.
   vs.view = View{0, "", ""}
-  vs.dead_backup = false
-  vs.dead_primary = false
-  vs.idle = ""
-  vs.count_backup = 0
-  vs.count_primary = 0
+  //vs.dead_backup = false
+   //vs.dead_primary = false
+   //vs.idle = ""
+   //vs.count_backup = 0
+   //vs.count_primary = 0
+  vs.primaryAck = 0
+  vs.backupAck = 0
+  vs.primaryTick = 0
+  vs.backupTick = 0
+  vs.currentTick = 0
 
   // tell net/rpc about our RPC server and handlers.
   rpcs := rpc.NewServer()
