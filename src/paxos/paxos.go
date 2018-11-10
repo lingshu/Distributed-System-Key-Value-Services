@@ -20,7 +20,12 @@ package paxos
 // px.Min() int -- instances before this seq have been forgotten
 //
 
-import "net"
+import (
+  "math"
+  "net"
+  "strconv"
+  "time"
+)
 import "net/rpc"
 import "log"
 import "os"
@@ -41,7 +46,52 @@ type Paxos struct {
 
 
   // Your data here.
+  minSeq int
+  majorityNum int
+  instances map[int]*State
+  doneSeqs []int
+  maxSeq int
 }
+
+type ProposeArgs struct {
+  Seq int
+  ProposalNum string
+}
+
+type ProposeReply struct {
+  ProposeOk bool
+  Na string
+  Va interface{}
+}
+
+type AcceptArgs struct {
+  Seq int
+  ProposalNum string
+  MaxV interface{}
+}
+
+type AcceptReply struct {
+  AcceptOk bool
+}
+
+type State struct {
+  np string
+  na string
+  va interface{}
+  status bool
+}
+
+type DecideArgs struct {
+  Seq int
+  ProposalNum string
+  MaxV interface{}
+}
+
+type DecideReply struct {
+  Done int
+}
+
+const InitialValue = -1
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -79,7 +129,168 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
   return false
 }
 
+func (px *Paxos) createMajorityServers() map[int]string {
+  servers := make(map[int]string)
+  count := 0
+  for count < px.majorityNum {
+    index := rand.Intn(len(px.peers))
+    if _, exist := servers[index]; exist {
+      continue
+    }
+    servers[index] = px.peers[index]
+    count++
+  }
+  return servers
+}
 
+func (px *Paxos) Propose(args *ProposeArgs, reply *ProposeReply) error {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  reply.ProposeOk = false
+  if _, exist := px.instances[args.Seq]; !exist {
+    px.instances[args.Seq] = &State{"", "", nil, false}
+  }
+
+  if args.ProposalNum >= px.instances[args.Seq].np {
+    px.instances[args.Seq].np = args.ProposalNum
+    reply.ProposeOk = true
+    reply.Na = px.instances[args.Seq].na
+    reply.Va = px.instances[args.Seq].va
+  }
+  return nil
+}
+
+func (px *Paxos) sendPropose(seq int, proposalNum string, servers map[int]string, v interface{}) (interface{}, bool) {
+  args := &ProposeArgs{seq, proposalNum}
+  var reply ProposeReply
+  maxSeq := ""
+  maxV := v
+  count := 0
+  for index, server := range servers {
+    ret := false
+    if index == px.me {
+      err := px.Propose(args, &reply)
+      if err == nil {
+        ret = true
+      }
+    } else {
+      ret = call(server, "Paxos.Propose", args, &reply)
+    }
+    if ret && reply.ProposeOk {
+      if reply.Na > maxSeq {
+        maxSeq = reply.Na
+        maxV = reply.Va
+      }
+      count++
+    }
+  }
+  return maxV, count == px.majorityNum
+}
+
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  reply.AcceptOk = false
+  if _, exist := px.instances[args.Seq]; !exist {
+    px.instances[args.Seq] = &State{"", "", nil, false}
+  }
+
+  if args.ProposalNum >= px.instances[args.Seq].np {
+    px.instances[args.Seq].np = args.ProposalNum
+    px.instances[args.Seq].na = args.ProposalNum
+    px.instances[args.Seq].va = args.MaxV
+    reply.AcceptOk = true
+  }
+  return nil
+}
+
+func (px *Paxos) sendAccept(seq int, proposalNum string, maxV interface{}, servers map[int]string) bool {
+  args := &AcceptArgs{seq, proposalNum, maxV}
+  var reply AcceptReply
+  count := 0
+  for index, server := range servers {
+    ret := false
+    if index == px.me {
+      err := px.Accept(args, &reply)
+      if err == nil {
+        ret = true
+      }
+    } else {
+      ret = call(server, "Paxos.Accept", args, &reply)
+    }
+
+    if ret && reply.AcceptOk {
+      count++
+    }
+  }
+  return count == px.majorityNum
+}
+
+func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  if _, exist := px.instances[args.Seq]; !exist {
+    px.instances[args.Seq] = &State{"", args.ProposalNum, args.MaxV, true}
+  } else {
+    px.instances[args.Seq].na = args.ProposalNum
+    px.instances[args.Seq].va = args.MaxV
+    px.instances[args.Seq].status = true
+  }
+
+  if args.Seq > px.maxSeq {
+    px.maxSeq = args.Seq
+  }
+  reply.Done = px.doneSeqs[px.me]
+  return nil
+}
+
+func (px *Paxos) sendDecide(seq int, proposalNum string, maxV interface{}) {
+  args := &DecideArgs{seq, proposalNum, maxV}
+  var reply DecideReply
+  ok := false
+  min := math.MaxInt32
+  dones := make([]int, len(px.peers))
+  for ok == false {
+    ok = true
+    for index, server := range px.peers {
+      ret := false
+      if index == px.me {
+        err := px.Decide(args, &reply)
+        if err == nil {
+          ret = true
+        }
+      } else {
+        ret = call(server, "Paxos.Decide", args, &reply)
+      }
+      if ret == true {
+        if reply.Done < min {
+          min = reply.Done
+        }
+        dones[index] = reply.Done
+      } else {
+        ok = false
+      }
+    }
+    if ok == false {
+      time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+    }
+  }
+
+  if min != InitialValue {
+    px.mu.Lock()
+    px.doneSeqs = dones
+    for index, _ := range px.instances {
+      if index <= min {
+        delete(px.instances, index)
+      }
+    }
+    px.minSeq = min + 1
+    px.mu.Unlock()
+  }
+}
 //
 // the application wants paxos to start agreement on
 // instance seq, with proposed value v.
@@ -89,6 +300,28 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
   // Your code here.
+  go func() {
+    if seq < px.minSeq {
+      return
+    }
+
+    for {
+      proposalNum := strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + strconv.FormatInt(int64(px.me), 10)
+      majorityServers := px.createMajorityServers()
+      maxV, ok := px.sendPropose(seq, proposalNum, majorityServers, v)
+      if ok {
+        ok := px.sendAccept(seq, proposalNum, maxV, majorityServers)
+        if ok {
+          px.sendDecide(seq, proposalNum, maxV)
+          break
+        } else {
+          time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+        }
+      } else {
+        time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+      }
+    }
+  }()
 }
 
 //
@@ -99,6 +332,9 @@ func (px *Paxos) Start(seq int, v interface{}) {
 //
 func (px *Paxos) Done(seq int) {
   // Your code here.
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  px.doneSeqs[px.me] = seq
 }
 
 //
@@ -108,7 +344,9 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
   // Your code here.
-  return 0
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  return px.maxSeq
 }
 
 //
@@ -141,7 +379,25 @@ func (px *Paxos) Max() int {
 // 
 func (px *Paxos) Min() int {
   // You code here.
-  return 0
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  min := math.MaxInt32
+  for _, seq := range px.doneSeqs {
+    if seq < min {
+      min = seq
+    }
+  }
+
+  if px.minSeq <= min {
+    for seq, _ := range px.instances {
+      if seq <= min {
+        delete(px.instances, seq)
+      }
+    }
+    px.minSeq = min + 1
+  }
+  return px.minSeq
 }
 
 //
@@ -153,7 +409,18 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
   // Your code here.
-  return false, nil
+  minSeq := px.Min()
+  if seq < minSeq {
+    return false, nil
+  }
+
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  if state, ok := px.instances[seq]; ok {
+    return state.status, state.va
+  } else {
+    return false, nil
+  }
 }
 
 
@@ -181,6 +448,15 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 
 
   // Your initialization code here.
+  px.majorityNum = len(px.peers) / 2 + 1
+  px.minSeq = 0
+  px.maxSeq = InitialValue
+  px.doneSeqs = make([]int, len(px.peers))
+  for i := 0; i < len(px.peers); i++ {
+    px.doneSeqs[i] = InitialValue
+  }
+  px.instances = make(map[int]*State)
+
 
   if rpcs != nil {
     // caller will create socket &c
