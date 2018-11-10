@@ -21,9 +21,7 @@ package paxos
 //
 
 import (
-  "math"
   "net"
-  "strconv"
   "time"
 )
 import "net/rpc"
@@ -46,52 +44,83 @@ type Paxos struct {
 
 
   // Your data here.
-  minSeq int
-  majorityNum int
-  instances map[int]*State
-  doneSeqs []int
-  maxSeq int
+  proposerMgr *ProposerManager
+  acceptorMgr *AcceptorManager
+
+  instanceState map[int]interface{}
+
+  doneSeqs     []int // non-local, except doneSeqs[me]
+  minDoneSeq   int   // the minimal in doneSeqs
+  minDoneIndex int   // the index of the minimal in doneSeqs
 }
 
-type ProposeArgs struct {
+type ProposerManager struct {
+  px             *Paxos
+  mu             sync.Mutex
+  peers          []string
+  me             int // index of the proposers
+  proposers      map[int]*Proposer
+  seqMax        int
+  seq_chosen_max int
+}
+
+type AcceptorManager struct {
+  mu        sync.Mutex
+  acceptors map[int]*Acceptor
+  seqMax   int
+}
+
+type Proposer struct {
+  mgr           *ProposerManager
+  seq           int
+  propose_value interface{}
+  isDead        bool
+}
+
+type Acceptor struct {
+  mu sync.Mutex
+  // init: -1, -1, ""
+  n_p int
+  n_a int
+  v_a interface{}
+}
+
+type PrepareReply struct {
+  N    int // for choosing next proposing number
+  N_a  int
+  V_a  interface{}
+  Succ bool
+}
+
+type PrepareArgs struct {
   Seq int
-  ProposalNum string
+  N   int
 }
 
-type ProposeReply struct {
-  ProposeOk bool
-  Na string
-  Va interface{}
+type AcceptReply struct {
+  N    int // for choosing next proposing number
+  Succ bool
 }
 
 type AcceptArgs struct {
   Seq int
-  ProposalNum string
-  MaxV interface{}
-}
-
-type AcceptReply struct {
-  AcceptOk bool
-}
-
-type State struct {
-  np string
-  na string
-  va interface{}
-  status bool
+  N   int
+  V   interface{}
 }
 
 type DecideArgs struct {
   Seq int
-  ProposalNum string
-  MaxV interface{}
+  V   interface{}
 }
 
-type DecideReply struct {
-  Done int
+type DecideReply bool
+
+type SeqArgs struct {
+  Sender int
+  Seq    int
 }
 
-const InitialValue = -1
+type SeqReply bool
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -129,168 +158,238 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
   return false
 }
 
-func (px *Paxos) createMajorityServers() map[int]string {
-  servers := make(map[int]string)
-  count := 0
-  for count < px.majorityNum {
-    index := rand.Intn(len(px.peers))
-    if _, exist := servers[index]; exist {
-      continue
+func (acceptorMgr *AcceptorManager) GetInstance(seq int) *Acceptor {
+  acceptorMgr.mu.Lock()
+  defer acceptorMgr.mu.Unlock()
+
+  // only the seq that has not been accepted can be considered to be accepted
+  acceptor, ok := acceptorMgr.acceptors[seq]
+  if !ok {
+    if seq > acceptorMgr.seqMax {
+      acceptorMgr.seqMax = seq
     }
-    servers[index] = px.peers[index]
-    count++
+    acceptor = &Acceptor{n_p: -1, n_a: -1, v_a: nil}
+    acceptorMgr.acceptors[seq] = acceptor
   }
-  return servers
+  return acceptor
 }
 
-func (px *Paxos) Propose(args *ProposeArgs, reply *ProposeReply) error {
-  px.mu.Lock()
-  defer px.mu.Unlock()
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+  acceptor := px.acceptorMgr.GetInstance(args.Seq)
+  acceptor.mu.Lock()
+  defer acceptor.mu.Unlock()
 
-  reply.ProposeOk = false
-  if _, exist := px.instances[args.Seq]; !exist {
-    px.instances[args.Seq] = &State{"", "", nil, false}
-  }
-
-  if args.ProposalNum >= px.instances[args.Seq].np {
-    px.instances[args.Seq].np = args.ProposalNum
-    reply.ProposeOk = true
-    reply.Na = px.instances[args.Seq].na
-    reply.Va = px.instances[args.Seq].va
+  if args.N > acceptor.n_p {
+    reply.Succ = true
+    acceptor.n_p = args.N
+    reply.N = args.N
+    reply.N_a = acceptor.n_a
+    reply.V_a = acceptor.v_a
+  } else {
+    reply.Succ = false
+    reply.N = acceptor.n_p
   }
   return nil
-}
-
-func (px *Paxos) sendPropose(seq int, proposalNum string, servers map[int]string, v interface{}) (interface{}, bool) {
-  args := &ProposeArgs{seq, proposalNum}
-  var reply ProposeReply
-  maxSeq := ""
-  maxV := v
-  count := 0
-  for index, server := range servers {
-    ret := false
-    if index == px.me {
-      err := px.Propose(args, &reply)
-      if err == nil {
-        ret = true
-      }
-    } else {
-      ret = call(server, "Paxos.Propose", args, &reply)
-    }
-    if ret && reply.ProposeOk {
-      if reply.Na > maxSeq {
-        maxSeq = reply.Na
-        maxV = reply.Va
-      }
-      count++
-    }
-  }
-  return maxV, count == px.majorityNum
 }
 
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
-  px.mu.Lock()
-  defer px.mu.Unlock()
-
-  reply.AcceptOk = false
-  if _, exist := px.instances[args.Seq]; !exist {
-    px.instances[args.Seq] = &State{"", "", nil, false}
-  }
-
-  if args.ProposalNum >= px.instances[args.Seq].np {
-    px.instances[args.Seq].np = args.ProposalNum
-    px.instances[args.Seq].na = args.ProposalNum
-    px.instances[args.Seq].va = args.MaxV
-    reply.AcceptOk = true
+  acceptor := px.acceptorMgr.GetInstance(args.Seq)
+  acceptor.mu.Lock()
+  defer acceptor.mu.Unlock()
+  if args.N >= acceptor.n_p {
+    reply.Succ = true
+    acceptor.n_p = args.N
+    acceptor.n_a = args.N
+    acceptor.v_a = args.V
+    reply.N = args.N
+  } else {
+    reply.Succ = false
+    reply.N = acceptor.n_p
   }
   return nil
 }
 
-func (px *Paxos) sendAccept(seq int, proposalNum string, maxV interface{}, servers map[int]string) bool {
-  args := &AcceptArgs{seq, proposalNum, maxV}
-  var reply AcceptReply
-  count := 0
-  for index, server := range servers {
-    ret := false
-    if index == px.me {
-      err := px.Accept(args, &reply)
-      if err == nil {
-        ret = true
-      }
-    } else {
-      ret = call(server, "Paxos.Accept", args, &reply)
-    }
+func (proposerMgr *ProposerManager) RunProposer(seq int, v interface{}) {
+  proposerMgr.mu.Lock()
+  defer proposerMgr.mu.Unlock()
 
-    if ret && reply.AcceptOk {
-      count++
+  // only propose the seq that has not been proposed
+  if _, ok := proposerMgr.proposers[seq]; !ok {
+  	// change seqMax
+    if seq > proposerMgr.seqMax {
+      proposerMgr.seqMax = seq
     }
+    prop := &Proposer{mgr: proposerMgr, seq: seq, propose_value: v, isDead: false}
+    proposerMgr.proposers[seq] = prop
+    go func() {
+      prop.Propose()
+    }()
   }
-  return count == px.majorityNum
 }
 
 func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
   px.mu.Lock()
   defer px.mu.Unlock()
-
-  if _, exist := px.instances[args.Seq]; !exist {
-    px.instances[args.Seq] = &State{"", args.ProposalNum, args.MaxV, true}
-  } else {
-    px.instances[args.Seq].na = args.ProposalNum
-    px.instances[args.Seq].va = args.MaxV
-    px.instances[args.Seq].status = true
-  }
-
-  if args.Seq > px.maxSeq {
-    px.maxSeq = args.Seq
-  }
-  reply.Done = px.doneSeqs[px.me]
+  // assertion: it must be an idempotent operation
+  px.instanceState[args.Seq] = args.V
+  *reply = DecideReply(true)
   return nil
 }
 
-func (px *Paxos) sendDecide(seq int, proposalNum string, maxV interface{}) {
-  args := &DecideArgs{seq, proposalNum, maxV}
-  var reply DecideReply
-  ok := false
-  min := math.MaxInt32
-  dones := make([]int, len(px.peers))
-  for ok == false {
-    ok = true
-    for index, server := range px.peers {
-      ret := false
-      if index == px.me {
-        err := px.Decide(args, &reply)
-        if err == nil {
-          ret = true
-        }
-      } else {
-        ret = call(server, "Paxos.Decide", args, &reply)
-      }
-      if ret == true {
-        if reply.Done < min {
-          min = reply.Done
-        }
-        dones[index] = reply.Done
-      } else {
-        ok = false
+func (proposer *Proposer) sendPropose(proposeNum int, nextProposeNum int) (int, interface{}, bool) {
+	majoritySize := len(proposer.mgr.peers)/2 + 1
+	prepareReplies := make(chan PrepareReply, len(proposer.mgr.peers))
+	prepareBarrier := make(chan bool)
+
+	for me, peer := range proposer.mgr.peers {
+		go func(me int, peer string) {
+			args := &PrepareArgs{Seq: proposer.seq, N: proposeNum}
+			var reply PrepareReply
+
+			ret := false
+			if me == proposer.mgr.me {
+				err := proposer.mgr.px.Prepare(args, &reply)
+				if err == nil {
+					ret = true
+				}
+			} else {
+				ret = call(peer, "Paxos.Prepare", args, &reply)
+			}
+			prepareBarrier <- true
+
+			if ret {
+				if reply.Succ {
+					prepareReplies <- reply
+				} else if reply.N > nextProposeNum {
+					nextProposeNum = reply.N
+				}
+			}
+		}(me, peer)
+	}
+
+	for i := 0; i < len(proposer.mgr.peers); i++ {
+		<-prepareBarrier
+	}
+
+	var acceptedValue interface{} = nil
+	ok := false
+	if len(prepareReplies) >= majoritySize {
+		ok = true
+		// choose the V_a corresponding to the max N_a to be the acceptedValue
+		acceptedProposeNum := -1
+		repliesNum := len(prepareReplies)
+		for i := 0; i < repliesNum; i++ {
+			r := <-prepareReplies
+			if r.N_a > acceptedProposeNum {
+				acceptedProposeNum = r.N_a
+				acceptedValue = r.V_a
+			}
+		}
+	}
+	return nextProposeNum, acceptedValue, ok
+}
+
+func (proposer *Proposer) sendAccept(proposeNum int, acceptedValue interface{}, nextProposeNum int) (interface{}, int, bool) {
+	majoritySize := len(proposer.mgr.peers)/2 + 1
+	acceptReplies := make(chan AcceptReply, len(proposer.mgr.peers))
+	acceptBarrier := make(chan bool)
+	var acceptReqValue interface{}
+
+	if acceptedValue != nil {
+		acceptReqValue = acceptedValue
+	} else {
+		acceptReqValue = proposer.propose_value
+	}
+
+	for me, peer := range proposer.mgr.peers {
+		go func(me int, peer string) {
+			args := &AcceptArgs{Seq: proposer.seq, N: proposeNum, V: acceptReqValue}
+			var reply AcceptReply
+
+			ret := false
+			if me == proposer.mgr.me {
+				err := proposer.mgr.px.Accept(args, &reply)
+				if err == nil {
+					ret = true
+				}
+			} else {
+				ret = call(peer, "Paxos.Accept", args, &reply)
+			}
+			acceptBarrier <- true
+			if ret {
+				if reply.Succ {
+					acceptReplies <- reply
+				} else if reply.N > nextProposeNum {
+					nextProposeNum = reply.N
+				}
+			}
+		}(me, peer)
+	}
+
+	for i := 0; i < len(proposer.mgr.peers); i++ {
+		<-acceptBarrier
+	}
+
+	ok := false
+	if len(acceptReplies) >= majoritySize {
+		ok = true
+	}
+	return acceptReqValue, nextProposeNum, ok
+}
+
+func (proposer *Proposer) sendDecision(acceptReqValue interface{}) {
+	for me, peer := range proposer.mgr.peers {
+		go func(me int, peer string) {
+			args := &DecideArgs{Seq: proposer.seq, V: acceptReqValue}
+			var reply DecideReply
+
+			ok := false
+			for !ok && !proposer.isDead {
+				if me == proposer.mgr.me {
+					err := proposer.mgr.px.Decide(args, &reply)
+					if err == nil {
+						ok = true
+					}
+				} else {
+					ok = call(peer, "Paxos.Decide", args, &reply)
+				}
+				time.Sleep(time.Second)
+			}
+		}(me, peer)
+	}
+}
+
+func (proposer *Proposer) chooseNextProposeNum(nextProposeNum int) (int) {
+	try_num := nextProposeNum/len(proposer.mgr.peers)*len(proposer.mgr.peers) + proposer.mgr.me
+	if try_num > nextProposeNum {
+		nextProposeNum = try_num
+	} else {
+		nextProposeNum = try_num + len(proposer.mgr.peers)
+	}
+	return nextProposeNum
+}
+
+func (proposer *Proposer) Propose() {
+  proposeNum := proposer.mgr.me
+  for !proposer.isDead {
+  	nextProposeNum := proposeNum
+  	nextProposeNum1, acceptedValue, ok:= proposer.sendPropose(proposeNum, nextProposeNum)
+    if ok {
+	  acceptReqValue, nextProposeNum2, ok := proposer.sendAccept(proposeNum, acceptedValue, nextProposeNum1)
+	  nextProposeNum = nextProposeNum2
+      if ok {
+      	proposer.sendDecision(acceptReqValue)
+        break
       }
     }
-    if ok == false {
-      time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
-    }
+  	nextProposeNum3 := proposer.chooseNextProposeNum(nextProposeNum)
+    proposeNum = nextProposeNum3
+
+    time.Sleep(50 * time.Millisecond)
   }
 
-  if min != InitialValue {
-    px.mu.Lock()
-    px.doneSeqs = dones
-    for index, _ := range px.instances {
-      if index <= min {
-        delete(px.instances, index)
-      }
-    }
-    px.minSeq = min + 1
-    px.mu.Unlock()
-  }
 }
+
 //
 // the application wants paxos to start agreement on
 // instance seq, with proposed value v.
@@ -300,30 +399,56 @@ func (px *Paxos) sendDecide(seq int, proposalNum string, maxV interface{}) {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
   // Your code here.
-  go func() {
-    if seq < px.minSeq {
-      return
-    }
+  if seq <= px.minDoneSeq {
+    return
+  }
 
-    for {
-      proposalNum := strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + strconv.FormatInt(int64(px.me), 10)
-      majorityServers := px.createMajorityServers()
-      maxV, ok := px.sendPropose(seq, proposalNum, majorityServers, v)
-      if ok {
-        ok := px.sendAccept(seq, proposalNum, maxV, majorityServers)
-        if ok {
-          px.sendDecide(seq, proposalNum, maxV)
-          break
-        } else {
-          time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
-        }
-      } else {
-        time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
-      }
-    }
-  }()
+  px.proposerMgr.RunProposer(seq, v)
 }
 
+func (px *Paxos) UpdateDoneSeqs(args *SeqArgs, reply *SeqReply) error {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  if args.Seq > px.doneSeqs[args.Sender] {
+    px.doneSeqs[args.Sender] = args.Seq
+    // the peer with the minimum done seq
+    if args.Sender == px.minDoneIndex {
+      px.minDoneSeq = args.Seq
+      for index, seq := range px.doneSeqs {
+        if seq < px.minDoneSeq {
+          px.minDoneSeq = seq
+          px.minDoneIndex = index
+        }
+      }
+
+      px.proposerMgr.mu.Lock()
+      for s, prop := range px.proposerMgr.proposers {
+        if s <= px.minDoneSeq {
+          prop.isDead = true
+          delete(px.proposerMgr.proposers, s)
+        }
+      }
+      px.proposerMgr.mu.Unlock()
+
+      for s, _ := range px.instanceState {
+        if s <= px.minDoneSeq {
+          delete(px.instanceState, s)
+        }
+      }
+
+      px.acceptorMgr.mu.Lock()
+      for s, _ := range px.acceptorMgr.acceptors {
+        if s <= px.minDoneSeq {
+          delete(px.acceptorMgr.acceptors, s)
+        }
+      }
+      px.acceptorMgr.mu.Unlock()
+
+    }
+  }
+  return nil
+}
 //
 // the application on this machine is done with
 // all instances <= seq.
@@ -332,9 +457,18 @@ func (px *Paxos) Start(seq int, v interface{}) {
 //
 func (px *Paxos) Done(seq int) {
   // Your code here.
-  px.mu.Lock()
-  defer px.mu.Unlock()
-  px.doneSeqs[px.me] = seq
+  for me, peer := range px.peers {
+    go func(me int, peer string) {
+      args := &SeqArgs{Seq: seq, Sender: px.me}
+      var reply SeqReply
+
+      if me == px.me {
+      	px.UpdateDoneSeqs(args, &reply)
+	  } else {
+	  	call(peer, "Paxos.UpdateDoneSeqs", args, &reply)
+	  }
+    }(me, peer)
+  }
 }
 
 //
@@ -344,9 +478,11 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
   // Your code here.
-  px.mu.Lock()
-  defer px.mu.Unlock()
-  return px.maxSeq
+  if px.acceptorMgr.seqMax > px.proposerMgr.seqMax {
+    return px.acceptorMgr.seqMax
+  } else {
+    return px.proposerMgr.seqMax
+  }
 }
 
 //
@@ -381,23 +517,7 @@ func (px *Paxos) Min() int {
   // You code here.
   px.mu.Lock()
   defer px.mu.Unlock()
-
-  min := math.MaxInt32
-  for _, seq := range px.doneSeqs {
-    if seq < min {
-      min = seq
-    }
-  }
-
-  if px.minSeq <= min {
-    for seq, _ := range px.instances {
-      if seq <= min {
-        delete(px.instances, seq)
-      }
-    }
-    px.minSeq = min + 1
-  }
-  return px.minSeq
+  return px.minDoneSeq + 1
 }
 
 //
@@ -409,15 +529,10 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
   // Your code here.
-  minSeq := px.Min()
-  if seq < minSeq {
-    return false, nil
-  }
-
   px.mu.Lock()
   defer px.mu.Unlock()
-  if state, ok := px.instances[seq]; ok {
-    return state.status, state.va
+  if value, exist := px.instanceState[seq]; exist && seq > px.minDoneSeq {
+    return true, value
   } else {
     return false, nil
   }
@@ -448,14 +563,17 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 
 
   // Your initialization code here.
-  px.majorityNum = len(px.peers) / 2 + 1
-  px.minSeq = 0
-  px.maxSeq = InitialValue
+  px.instanceState = make(map[int]interface{})
+
   px.doneSeqs = make([]int, len(px.peers))
   for i := 0; i < len(px.peers); i++ {
-    px.doneSeqs[i] = InitialValue
+    px.doneSeqs[i] = -1
   }
-  px.instances = make(map[int]*State)
+  px.minDoneSeq = -1
+  px.minDoneIndex = 0
+
+  px.proposerMgr = &ProposerManager{peers: peers, me: me, proposers: make(map[int]*Proposer), seqMax: -1, seq_chosen_max: -1, px: px}
+  px.acceptorMgr = &AcceptorManager{acceptors: make(map[int]*Acceptor), seqMax: -1}
 
 
   if rpcs != nil {

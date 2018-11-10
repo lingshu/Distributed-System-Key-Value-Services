@@ -36,6 +36,9 @@ type KVPaxos struct {
   px *paxos.Paxos
 
   // Your definitions here.
+  content map[string]string
+  seq     int // seq for next req
+  history map[int64]bool
 }
 
 
@@ -74,6 +77,9 @@ func StartServer(servers []string, me int) *KVPaxos {
   kv.me = me
 
   // Your initialization code here.
+  kv.content = make(map[string]string)
+  kv.history = make(map[int64]bool)
+  kv.seq = 0
 
   rpcs := rpc.NewServer()
   rpcs.Register(kv)
