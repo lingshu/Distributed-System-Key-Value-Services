@@ -143,7 +143,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
   if err != nil {
     err1 := err.(*net.OpError)
     if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
-      fmt.Printf("paxos Dial() failed: %v\n", err1)
+      //fmt.Printf("paxos Dial() failed: %v\n", err1)
     }
     return false
   }
@@ -422,25 +422,25 @@ func (px *Paxos) UpdateDoneSeqs(args *SeqArgs, reply *SeqReply) error {
         }
       }
 
+      for seq, _ := range px.instanceState {
+      	if seq <= px.minDoneSeq {
+      		delete(px.instanceState, seq)
+        }
+      }
+
       px.proposerMgr.mu.Lock()
-      for s, prop := range px.proposerMgr.proposers {
-        if s <= px.minDoneSeq {
+      for seq, prop := range px.proposerMgr.proposers {
+        if seq <= px.minDoneSeq {
           prop.isDead = true
-          delete(px.proposerMgr.proposers, s)
+          delete(px.proposerMgr.proposers, seq)
         }
       }
       px.proposerMgr.mu.Unlock()
 
-      for s, _ := range px.instanceState {
-        if s <= px.minDoneSeq {
-          delete(px.instanceState, s)
-        }
-      }
-
       px.acceptorMgr.mu.Lock()
-      for s, _ := range px.acceptorMgr.acceptors {
-        if s <= px.minDoneSeq {
-          delete(px.acceptorMgr.acceptors, s)
+      for seq, _ := range px.acceptorMgr.acceptors {
+        if seq <= px.minDoneSeq {
+          delete(px.acceptorMgr.acceptors, seq)
         }
       }
       px.acceptorMgr.mu.Unlock()
@@ -569,9 +569,9 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
   for i := 0; i < len(px.peers); i++ {
     px.doneSeqs[i] = -1
   }
+
   px.minDoneSeq = -1
   px.minDoneIndex = 0
-
   px.proposerMgr = &ProposerManager{peers: peers, me: me, proposers: make(map[int]*Proposer), seqMax: -1, seq_chosen_max: -1, px: px}
   px.acceptorMgr = &AcceptorManager{acceptors: make(map[int]*Acceptor), seqMax: -1}
 
