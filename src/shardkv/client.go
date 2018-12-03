@@ -1,6 +1,10 @@
 package shardkv
 
-import "shardmaster"
+import (
+  "crypto/rand"
+  "math/big"
+  "shardmaster"
+)
 import "net/rpc"
 import "time"
 import "sync"
@@ -11,14 +15,23 @@ type Clerk struct {
   sm *shardmaster.Clerk
   config shardmaster.Config
   // You'll have to modify Clerk.
+  me int64
+  logTail int
 }
 
-
+func nrand() int64 {
+  max := big.NewInt(int64(1) << 62)
+  bigx, _ := rand.Int(rand.Reader, max)
+  x := bigx.Int64()
+  return x
+}
 
 func MakeClerk(shardmasters []string) *Clerk {
   ck := new(Clerk)
   ck.sm = shardmaster.MakeClerk(shardmasters)
   // You'll have to modify MakeClerk.
+  ck.logTail = 0
+  ck.me = nrand()
   return ck
 }
 
@@ -92,12 +105,21 @@ func (ck *Clerk) Get(key string) string {
       for _, srv := range servers {
         args := &GetArgs{}
         args.Key = key
+        args.Seq = ck.logTail + 1
+        args.CID = ck.me
         var reply GetReply
         ok := call(srv, "ShardKV.Get", args, &reply)
         if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+          ck.logTail = ck.logTail + 1
           return reply.Value
         }
         if ok && (reply.Err == ErrWrongGroup) {
+          break
+        }
+
+        if ok && reply.Err == ErrReconfigHolding{
+          time.Sleep(250 * time.Millisecond)
+          DPrintf("Wait for reconfig\n")
           break
         }
       }
@@ -131,12 +153,20 @@ func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
         args.Key = key
         args.Value = value
         args.DoHash = dohash
+        args.CID = ck.me
+        args.Seq = ck.logTail + 1
         var reply PutReply
         ok := call(srv, "ShardKV.Put", args, &reply)
         if ok && reply.Err == OK {
+          ck.logTail = ck.logTail + 1
           return reply.PreviousValue
         }
         if ok && (reply.Err == ErrWrongGroup) {
+          break
+        }
+        if ok && reply.Err == ErrReconfigHolding{
+          time.Sleep(250 * time.Millisecond)
+          DPrintf("Wait for reconfig\n")
           break
         }
       }

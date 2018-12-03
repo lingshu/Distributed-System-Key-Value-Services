@@ -1,9 +1,6 @@
 package shardmaster
 
-import (
-  "net"
-  "time"
-)
+import "net"
 import "fmt"
 import "net/rpc"
 import "log"
@@ -12,7 +9,10 @@ import "sync"
 import "os"
 import "syscall"
 import "encoding/gob"
-import "math/rand"
+import (
+  "math/rand"
+  "time"
+)
 
 type ShardMaster struct {
   mu sync.Mutex
@@ -24,8 +24,17 @@ type ShardMaster struct {
 
   configs []Config // indexed by config num
   configNum int
-  logTail int
+  logTail int //the tail of the log, before which all have been performed in order onto state machine kvDB, initially -1
 }
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+  if Debug > 0 {
+    log.Printf(format, a...)
+  }
+  return
+}
+
+const Debug = 0
 
 
 type Op struct {
@@ -35,6 +44,8 @@ type Op struct {
   Shard int
   Num int
   Servers []string
+  //Uid int64
+
 }
 
 const (
@@ -53,100 +64,169 @@ func contains(s [NShards]int64, e int64) bool {
   return false
 }
 
-func (sm *ShardMaster) Update(newShards [NShards]int64, newGroups map[int64][]string) bool {
-  newConfig := make([]Config, 1)
-  newConfig[0].Num = sm.configNum + 1
-  newConfig[0].Groups = newGroups
-  newConfig[0].Shards = newShards
-  sm.configs = append(sm.configs, newConfig[0])
-  sm.configNum = sm.configNum + 1
-  sm.logTail = sm.logTail + 1
-  sm.px.Done(sm.logTail)
-  return true
-}
+func (sm *ShardMaster) catchUp(v Op) bool {
+  //DPrintf("ME: %d | Doing catchup for op: %s, seq num: %d", kv.me, v, kv.logTail +1)
 
-func (sm *ShardMaster) CatchUp(v Op) bool {
   switch optype := v.Type; optype {
-
   case JOIN:
 
-    // the old config's shards already own the GID
     if contains(sm.configs[sm.configNum].Shards, v.GID){
-      sm.logTail = sm.logTail + 1
+      //does not change config, but log + 1
+      sm.logTail = sm.logTail+1
       sm.px.Done(sm.logTail)
+      DPrintf("Invalid request...\n")
       return true
     }
+
+
+    DPrintf("sm.catchUp | Processing Join\n")
 
     oldConfig := sm.configs[sm.configNum]
     NumGroup := len(oldConfig.Groups) + 1
     shardsPerGroup := NShards / NumGroup
-    newShards := [NShards]int64{}
-    newGroups := make(map[int64][]string)
+    //remaining := NShards % NumGroup
+    var newGroups map[int64][]string
+    newGroups = make(map[int64][]string)
+    //var outstanding map[int]bool
+    //outstanding = make(map[int]bool)
+    var mapTemp map[int64]int
+    mapTemp = make(map[int64]int)
 
-    // extra group exists, keep the config as it is
-    if NumGroup > NShards {
-     for k, v := range oldConfig.Groups {
-       newGroups[k] = v
-     }
-     newGroups[v.GID] = v.Servers
+    var newShards[NShards]int64
 
-     for i, e := range oldConfig.Shards {
-       newShards[i] = e
-     }
+    if NumGroup > NShards{
+      //simply copy old
+      var newConfig []Config
+      newConfig = make([]Config, 1)
 
-     return sm.Update(newShards, newGroups)
+      for k, v := range oldConfig.Groups {
+        newGroups[k] = v
+      }
+      newGroups[v.GID] = v.Servers
+
+      for i, e := range oldConfig.Shards {
+        newShards[i] = e
+      }
+      //newConfig := &Config{}
+      newConfig[0].Num = sm.configNum+1
+      newConfig[0].Groups = newGroups
+      newConfig[0].Shards = newShards
+      sm.configs = append(sm.configs, newConfig[0])
+      sm.configNum = sm.configNum + 1
+      sm.logTail = sm.logTail+1
+      sm.px.Done(sm.logTail)
+      //DPrintf("Server: %s: %s\n", sm.me, sm.configs[sm.configNum].Shards)
+      //DPrintf("Server: %s: %s\n",sm.me, sm.configs[sm.configNum].Groups)
+      return true
+    }
+    count := 0
+    for i, e := range oldConfig.Shards{
+      if e != 0 {
+        //DPrintf("e = %d\n", e)
+        if mapTemp[e] < shardsPerGroup {
+          mapTemp[e] += 1
+          newShards[i] = e
+        }else if count < shardsPerGroup{
+          mapTemp[v.GID] += 1
+          newShards[i] = v.GID
+          count ++
+        }
+
+      }else{
+        newShards[i] = v.GID
+        }
     }
 
-    count := 0
-    mapTemp := make(map[int64]int)
-    for i, e := range oldConfig.Shards {
-      if e != 0 && mapTemp[e] < shardsPerGroup {
-        mapTemp[e] += 1
-        newShards[i] = e
-      } else if count < shardsPerGroup {
-        mapTemp[v.GID] += 1
-        newShards[i] = v.GID
-        count++
+
+    //if len(outstanding)
+    for i, e := range newShards {
+      if e == 0{
+        if mapTemp[oldConfig.Shards[i]] < shardsPerGroup + 1{
+          newShards[i] = oldConfig.Shards[i]
+          mapTemp[oldConfig.Shards[i]]  = mapTemp[oldConfig.Shards[i]] + 1
+          continue
+        }
+
+        for k, v := range mapTemp {
+          if v < shardsPerGroup + 1{
+            newShards[i] = k
+            mapTemp[k]  = v + 1
+            break
+          }
+        }
+
       }
     }
 
-    // put groups into new group
+
     for k, v := range oldConfig.Groups {
       newGroups[k] = v
     }
     newGroups[v.GID] = v.Servers
 
-    return sm.Update(newShards, newGroups)
+    //create a temp map to count shards per group
 
+
+
+    var newConfig []Config
+    newConfig = make([]Config, 1)
+    //newConfig := &Config{}
+    newConfig[0].Num = sm.configNum+1
+    newConfig[0].Groups = newGroups
+    newConfig[0].Shards = newShards
+    sm.configs = append(sm.configs, newConfig[0])
+    sm.configNum = sm.configNum + 1
+    sm.logTail = sm.logTail+1
+    sm.px.Done(sm.logTail)
+    //mem shrink
+    //DPrintf("Server: %s: %s\n", sm.me, sm.configs[sm.configNum].Shards)
+    //DPrintf("Server: %s: %s\n",sm.me, sm.configs[sm.configNum].Groups)
+
+    return true
   case LEAVE:
 
-    // the GID to leave does not exist
+    //
     _, ok := sm.configs[sm.configNum].Groups[v.GID]
     if !ok {
+      //does not exist
       sm.logTail = sm.logTail+1
       sm.px.Done(sm.logTail)
+      DPrintf("Leave error: not contain gid\n")
       return true
     }
 
-    newGroups := make(map[int64][]string)
-    newShards := [NShards]int64{}
-    outstanding := make(map[int]bool)
-    mapTemp := make(map[int64]int)
+    newConfig := &Config{}
+    newConfig.Num = sm.configNum+1
+
+    var newGroups map[int64][]string
+    newGroups = make(map[int64][]string)
+    var newShards[NShards]int64
+    var mapTemp map[int64]int
+    var outstanding map[int]bool
+    outstanding = make(map[int]bool)
+    mapTemp = make(map[int64]int)
 
     oldConfig := sm.configs[sm.configNum]
     NumGroup := len(oldConfig.Groups) - 1
     var shardsPerGroup int
-    if NumGroup <= 0 {
+    if NumGroup > 0{
+      if NumGroup > 10{
+        shardsPerGroup = 1
+      }else{
+        shardsPerGroup = NShards / NumGroup
+      }
+
+      //remaining = NShards % NumGroup
+    }else{
       shardsPerGroup = 0
-    } else if NumGroup > NShards {
-      shardsPerGroup = 1
-    } else {
-      shardsPerGroup = NShards / NumGroup
+      //remaining = 0
     }
 
-    // the GID to leave is not in use
-    if !contains(sm.configs[sm.configNum].Shards, v.GID) {
-      for i, e := range oldConfig.Shards {
+    if !contains(sm.configs[sm.configNum].Shards, v.GID){
+      //does not change config, but log + 1
+
+
+      for i, e := range oldConfig.Shards{
         newShards[i] = e
       }
 
@@ -156,113 +236,157 @@ func (sm *ShardMaster) CatchUp(v Op) bool {
         }
       }
 
-      return sm.Update(newShards, newGroups)
+      newConfig.Groups = newGroups
+      newConfig.Shards = newShards
+
+      sm.configs = append(sm.configs, *newConfig)
+
+      //do nothing
+      sm.configNum = sm.configNum + 1
+      sm.logTail = sm.logTail+1
+      sm.px.Done(sm.logTail)
+      return true
+
     }
 
-    // corner case: null newShards and newGroups
-    if NumGroup == 0 {
-      return sm.Update([NShards]int64{}, make(map[int64][]string))
-    }
 
-    // get mapTemp
-    for i, e := range oldConfig.Shards {
-      if e != v.GID {
-        newShards[i] = e
-        mapTemp[e] += 1
-      }
-    }
-    if NumGroup <= NShards {
-      for k, _ := range oldConfig.Groups {
-        _, ok := mapTemp[k]
-        if !ok && k != v.GID {
-          mapTemp[k] = 0
+
+
+
+
+    if NumGroup == 0{
+      newConfig.Groups = make(map[int64][]string)
+      var ns [NShards]int64
+      newConfig.Shards = ns
+
+    }else{
+      for i, e := range oldConfig.Shards{
+        if e != v.GID {
+          newShards[i] = e
+          mapTemp[e] = mapTemp[e] + 1
         }
       }
-    }
-
-    for i, e := range oldConfig.Shards {
+      //adding
+      if NumGroup <= NShards {
+        for k, _ := range oldConfig.Groups {
+          _, ok := mapTemp[k]
+          if !ok && k != v.GID {
+            mapTemp[k] = 0
+          }
+        }
+      }
       found := false
-      if e == v.GID {
-        for k, v := range mapTemp {
-          if v < shardsPerGroup {
-            newShards[i] = k
-            mapTemp[k] = v + 1
-            found = true
-            break
-          }
-        }
-
-        if !found {
-          outstanding[i] = true
-        }
-      }
-    }
-
-    for i, e := range outstanding {
-      if e {
-        if len(oldConfig.Groups) < NShards {
-          for k, v := range mapTemp {
-            if v <= shardsPerGroup {
+      for i, e := range oldConfig.Shards{
+        found = false
+        if e == v.GID {
+          for k, v := range mapTemp{
+            if v < shardsPerGroup {
               newShards[i] = k
-              mapTemp[k] += 1
+              mapTemp[k] = v + 1
+              found = true
               break
             }
           }
-        } else {
-          for k, _ := range oldConfig.Groups {
-            freq, ok := mapTemp[k]
-            if k != v.GID && (!ok || freq == 0) {
-              newShards[i] = k
-              mapTemp[k] = 1
-              break
-            }
+          if !found{
+            outstanding[i] = true
           }
+          //add to outstanding queue
+
         }
       }
-    }
+      //fix the outstanding shards
+      for i, e := range outstanding{
 
-    for k, value := range oldConfig.Groups {
-      if k != v.GID{
-        newGroups[k] = value
+        if e {
+          DPrintf("outstanding: %d\n", i)
+          if len(oldConfig.Groups) >= NShards{
+            for k, _ := range oldConfig.Groups {
+              _, ok := mapTemp[k]
+              if k != v.GID && !ok{
+                newShards[i] = k
+                mapTemp[k] = 1
+              }
+            }
+          }else{
+            for k,v := range mapTemp{
+              if v <= shardsPerGroup {
+                newShards[i] = k
+                mapTemp[k] = v +  1
+                break
+              }
+            }
+          }
+
+        }
       }
+      //get new group
+      for k, value := range oldConfig.Groups{
+        if k != v.GID{
+          newGroups[k] = value
+        }
+      }
+      newConfig.Groups = newGroups
+      newConfig.Shards = newShards
+
     }
 
-    return sm.Update(newShards, newGroups)
+    sm.configs = append(sm.configs, *newConfig)
 
+    //do nothing
+    sm.configNum = sm.configNum + 1
+    sm.logTail = sm.logTail+1
+    sm.px.Done(sm.logTail)
+    //kv.dupDic[v.Uid] = true
+    //kv.replyDic[v.Uid] = kv.kvDB[v.Key]
+    //DPrintf("Server: %s: %s\n", sm.me, sm.configs[sm.configNum].Shards)
+    //DPrintf("Server: %s: %s\n",sm.me, sm.configs[sm.configNum].Groups)
+    return true
   case MOVE:
-
     oldConfig := sm.configs[sm.configNum]
-    newGroups := make(map[int64][]string)
-    newShards := [NShards]int64{}
+    var newGroups map[int64][]string
+    newGroups = make(map[int64][]string)
+    var newShards[NShards]int64
 
-    for i, e := range oldConfig.Shards {
+    newConfig := &Config{}
+    newConfig.Num = sm.configNum+1
+
+    for i, e := range oldConfig.Shards{
       if i != v.Shard {
         newShards[i] = e
-      } else {
+
+      }else{
         newShards[i] = v.GID
       }
     }
+    for k, value := range oldConfig.Groups{
 
-    for k, value := range oldConfig.Groups {
-      newGroups[k] = value
+        newGroups[k] = value
 
     }
-    return sm.Update(newShards, newGroups)
+    newConfig.Shards = newShards
+    newConfig.Groups = newGroups
 
+    sm.configs= append(sm.configs, *newConfig)
+
+    sm.logTail = sm.logTail+1
+    sm.configNum = sm.configNum + 1
+    sm.px.Done(sm.logTail)
+    //kv.dupDic[v.Uid] = true
+    //kv.replyDic[v.Uid] = prevStr
+    //DPrintf("After Moving shard: %d with gid %d Server: %s: %s\n",v.Shard, v.GID, sm.me, sm.configs[sm.configNum].Shards)
+    //DPrintf("After Moving shard: %d with gid %d Server: %s: %s\n",v.Shard, v.GID,sm.me, sm.configs[sm.configNum].Groups)
+    return true
   case QUERY:
-
-    sm.logTail = sm.logTail + 1
+    sm.logTail = sm.logTail+1
     sm.px.Done(sm.logTail)
     return true
-
   default:
-
     return false
+    DPrintf("SHOULD NOT PRINT DEFAULT\n")
   }
-
+  DPrintf("SHOULD NOT PRINT DEFAULT\n")
   return true
 }
-
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) error {
   // Your code here.
@@ -271,18 +395,18 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) error {
   newJoin := Op{Type: JOIN, GID: args.GID, Servers: args.Servers}
 
   var tentativeSeq int
-  for true {
+  for {
     tentativeSeq = sm.logTail + 1
+
     decided, op := sm.px.Status(tentativeSeq)
     if decided {
-      newOp := op.(Op)
-      sm.CatchUp(newOp)
-
+      op1, _ := op.(Op)
+      sm.catchUp(op1)
     } else {
       break
     }
   }
-  for true {
+  for {
     to := 10 * time.Millisecond
     tentativeSeq = sm.logTail + 1
 
@@ -295,18 +419,20 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) error {
       }
 
       decided, op := sm.px.Status(tentativeSeq)
+
       if decided {
-         newOp, _ := op.(Op)
-         if newOp.GID == newJoin.GID && newOp.Type == JOIN {
-           sm.CatchUp(newOp)
-           sm.mu.Unlock()
-           return nil
-         }else {
-           sm.CatchUp(newOp)
-           break
-         }
+        newOp, _ := op.(Op)
+        if newOp.GID == newJoin.GID && newOp.Type == JOIN {
+          sm.catchUp(newOp)
+          sm.mu.Unlock()
+          return nil
+        } else {
+          sm.catchUp(newOp)
+          break
+        }
       }
     }
+
   }
   sm.mu.Unlock()
   return nil
@@ -317,14 +443,14 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) error {
   sm.mu.Lock()
 
   newLeave := Op{Type: LEAVE, GID: args.GID}
-  var tentativeSeq int
 
+  var tentativeSeq int
   for {
     tentativeSeq = sm.logTail + 1
     decided, op := sm.px.Status(tentativeSeq)
     if decided {
       newOp := op.(Op)
-      sm.CatchUp(newOp)
+      sm.catchUp(newOp)
     } else {
       break
     }
@@ -346,13 +472,13 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) error {
       if decided {
         newOp := op.(Op)
         if newOp.GID == newLeave.GID && newOp.Type == LEAVE {
-          sm.CatchUp(newOp)
+          sm.catchUp(newOp)
           sm.mu.Unlock()
           return nil
         } else {
-          sm.CatchUp(newOp)
+          sm.catchUp(newOp)
           break
-       }
+        }
       }
     }
   }
@@ -367,17 +493,18 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) error {
   newMove := Op{Type: MOVE, GID: args.GID, Shard: args.Shard}
 
   var tentativeSeq int
-  for true{
+  for {
     tentativeSeq = sm.logTail + 1
 
     decided, op := sm.px.Status(tentativeSeq)
     if decided {
       newOp := op.(Op)
-      sm.CatchUp(newOp)
-      } else {
-        break
+      sm.catchUp(newOp)
+    } else {
+      break
     }
   }
+
   for {
     to := 10 * time.Millisecond
     tentativeSeq = sm.logTail + 1
@@ -392,14 +519,13 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) error {
 
       decided, op := sm.px.Status(tentativeSeq)
       if decided {
-        if newOp, ok := op.(Op); ok {
-          if newOp.GID == newMove.GID && newOp.Type == MOVE && newOp.Shard == newMove.Shard {
-            sm.CatchUp(newOp)
-            sm.mu.Unlock()
-            return nil
-          }
+        newOp := op.(Op)
+        if newOp.GID == newMove.GID && newOp.Type == MOVE && newOp.Shard == newMove.Shard {
+          sm.catchUp(newOp)
+          sm.mu.Unlock()
+          return nil
         } else {
-          sm.CatchUp(newOp)
+          sm.catchUp(newOp)
           break
         }
       }
@@ -414,13 +540,14 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) error {
   sm.mu.Lock()
 
   newQuery := Op{Type: QUERY, Num: args.Num}
+
   var tentativeSeq int
   for {
     tentativeSeq = sm.logTail + 1
     decided, op := sm.px.Status(tentativeSeq)
     if decided {
       newOp := op.(Op)
-      sm.CatchUp(newOp)
+      sm.catchUp(newOp)
     } else {
       break
     }
@@ -440,20 +567,20 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) error {
 
       decided, op := sm.px.Status(tentativeSeq)
       if decided {
-       newOp := op.(Op)
-       if newOp.Type == QUERY && newOp.Num == newQuery.Num {
-         sm.CatchUp(newOp)
-         if newOp.Num == -1 || newOp.Num > sm.configNum {
-           reply.Config = sm.configs[sm.configNum]
-         } else {
-           reply.Config = sm.configs[newOp.Num]
-         }
-         sm.mu.Unlock()
-         return nil
-       } else {
-         sm.CatchUp(newOp)
-         break
-       }
+        newOp := op.(Op)
+        if newOp.Type == QUERY && newOp.Num == newQuery.Num {
+          sm.catchUp(newOp)
+          if newOp.Num == -1 || newOp.Num > sm.configNum {
+            reply.Config = sm.configs[sm.configNum]
+          } else {
+            reply.Config = sm.configs[newOp.Num]
+          }
+          sm.mu.Unlock()
+          return nil
+        } else {
+          sm.catchUp(newOp)
+          break
+        }
       }
     }
   }

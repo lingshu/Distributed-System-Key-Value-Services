@@ -14,6 +14,7 @@ const (
   OK = "OK"
   ErrNoKey = "ErrNoKey"
   ErrWrongGroup = "ErrWrongGroup"
+  ErrReconfigHolding = "ErrReconfigHolding"
 )
 type Err string
 
@@ -24,7 +25,8 @@ type PutArgs struct {
   // You'll have to add definitions here.
   // Field names must start with capital letters,
   // otherwise RPC will break.
-
+  CID int64
+  Seq int
 }
 
 type PutReply struct {
@@ -35,6 +37,8 @@ type PutReply struct {
 type GetArgs struct {
   Key string
   // You'll have to add definitions here.
+  CID int64
+  Seq int
 }
 
 type GetReply struct {
@@ -47,5 +51,17 @@ func hash(s string) uint32 {
   h := fnv.New32a()
   h.Write([]byte(s))
   return h.Sum32()
+}
+
+type FetchArgs struct{
+  ShardNum int
+  ConfigNum int
+}
+
+type FetchReply struct{
+  Err Err
+  ReplyDic map[int64]int  //cid : seq
+  ReplyCache map[int64]PutReply //will use putreply for now, however, it can also be getreply
+  KVDB map[string]string
 }
 
