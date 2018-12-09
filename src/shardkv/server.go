@@ -19,10 +19,10 @@ import "shardmaster"
 const Debug=0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-        if Debug > 0 {
-                log.Printf(format, a...)
-        }
-        return
+       if Debug > 0 {
+               log.Printf(format, a...)
+       }
+       return
 }
 
 const (
@@ -67,11 +67,42 @@ type ShardKV struct {
   curConfig shardmaster.Config//since required sequential consistency, we can have one copy locally used to check ErrWrongGroup, and update by tick()
 }
 
-func (kv *ShardKV) correctGroup(key string) bool {
-  if kv.gid == kv.curConfig.Shards[key2shard(key)]{
-    return true
-  }
-  return false
+func (kv *ShardKV) SendShardInfo(args *FetchArgs, reply *FetchReply) error {
+	// wait till the config number is the same as reconfiguration number
+	if args.ConfigNum > kv.curConfig.Num {
+		reply.Err = ErrReconfigHolding
+		return nil
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// copy all info from the old owner to the new one
+	cache := make(map[int64]PutReply)
+	kvDB := make(map[string]string)
+	replyDic := make(map[int64]int)
+
+	for k, v := range kv.replyCache {
+		cache[k] = v
+	}
+
+	for k, v := range kv.kvDB {
+		if key2shard(k) == args.ShardNum {
+			kvDB[k] = v
+		}
+	}
+
+	for k, v := range kv.replyDic {
+		replyDic[k] = v
+	}
+
+	reply.ReplyDic = replyDic
+	reply.KVDB = kvDB
+	reply.ReplyCache = cache
+	reply.Err = OK
+
+	return nil
+
 }
 
 func concatHash(prevStr string, newStr string) string {
@@ -81,239 +112,142 @@ func concatHash(prevStr string, newStr string) string {
   return strconv.Itoa(int(res))
 }
 
-func (kv *ShardKV) mergeDB(cache map[int64]PutReply, DB map[string]string, reply map[int64]int){
-  //updating kvDB
-  for k, v := range DB{
-    kv.kvDB[k] = v
-  }
-
-  //updating reply if needed
-  for k, v := range reply{
-    if kv.replyDic[k] < v{
-      kv.replyDic[k] = v
-      kv.replyCache[k] = cache[k]
-    }
-  }
-
-}
-
-func (kv *ShardKV) isDuplicate(cid int64, seq int) (bool, PutReply) {
-  //v,ok := kv.dupDic[uid]
-  v, ok := kv.replyDic[cid]
-  var pr PutReply
-  if ok {
-    // if the seq to be checked < seq, we have nothing to return,
-    // and since there should be only one outstanding request from the client
-    // we expect this never happen
-    if seq < v{
-      DPrintf("The seq to be checked is smaller than the last seq of that client, which should not happen\n")
-      return true, pr
-    }else if v == seq{
-      return true, kv.replyCache[cid]
-    }
-
-
-  }
-  return false, pr
-
-}
-
-func (kv *ShardKV) SendShardInfo(args *FetchArgs, reply *FetchReply) error{
-
-
-
-	DPrintf("Group %d: me %d locked\n", kv.gid, kv.me)
-	if args.ConfigNum > kv.curConfig.Num{
-		DPrintf("Not ready yet, my current num is: %d, wanted: %d\n", kv.curConfig.Num, args.ConfigNum)
-		reply.Err = ErrReconfigHolding
-		return nil
-	}
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-
-	var cache = make(map[int64]PutReply)
-	var kvDB = make(map[string]string)
-	var replyDic = make(map[int64]int)
-
-
-	for k,v := range kv.replyCache{
-		cache[k] = v
-	}
-
-	for k, v := range kv.kvDB{
-		if key2shard(k) == args.ShardNum{
-			kvDB[k] = v
-		}
-	}
-
-	for k, v := range kv.replyDic{
-		replyDic[k] = v
-	}
-	reply.ReplyDic = replyDic
-	reply.KVDB = kvDB
-	reply.ReplyCache = cache
-	reply.Err = OK
-
-	DPrintf("Group %d: me %d Unlocked\n", kv.gid, kv.me)
-
-	return nil
-
-}
-
 func (kv *ShardKV) catchUp(v Op) (reply PutReply) {
 
-  DPrintf("Server: %d : %d | Doing catchup for op: %s, seq num: %d",kv.gid, kv.me, v.Type, kv.logTail +1)
-
   switch optype := v.Type; optype {
+
   case PUT:
 
-    kv.logTail = kv.logTail+1
+    kv.logTail = kv.logTail + 1
     kv.px.Done(kv.logTail)
-
-
     reply := &PutReply{}
 
-    if kv.correctGroup(v.Key){
-      //reply.PreviousValue = v.Value
-      kv.kvDB[v.Key] = v.Value
-      reply.Err = OK
-      kv.replyCache[v.CID] = *reply
-      kv.replyDic[v.CID] = v.Seq
-    }else{
-      reply.Err = ErrWrongGroup
+    if kv.gid != kv.curConfig.Shards[key2shard(v.Key)] {
+	  reply.Err = ErrWrongGroup
+      return *reply
     }
 
-
+    kv.kvDB[v.Key] = v.Value
+    reply.Err = OK
+    kv.replyCache[v.CID] = *reply
+    kv.replyDic[v.CID] = v.Seq
     return *reply
+
   case GET:
-    //do nothing
-    kv.logTail = kv.logTail+1
-    kv.px.Done(kv.logTail)
 
+    kv.logTail = kv.logTail + 1
+    kv.px.Done(kv.logTail)
     reply := &PutReply{}
 
-    if kv.correctGroup(v.Key){
-      //reply.PreviousValue = v.Value
-      val, ok := kv.kvDB[v.Key]
-      if ok{
-        reply.Err = OK
-        reply.PreviousValue = val
-      }else{
-        reply.Err = ErrNoKey
-        reply.PreviousValue = ""
-      }
-      kv.replyDic[v.CID] = v.Seq
-      kv.replyCache[v.CID] = *reply
-    }else{
+    if kv.gid != kv.curConfig.Shards[key2shard(v.Key)] {
       reply.Err = ErrWrongGroup
+      return *reply
     }
 
-
+    if val, ok := kv.kvDB[v.Key]; ok {
+      reply.Err = OK
+      reply.PreviousValue = val
+    } else {
+      reply.Err = ErrNoKey
+      reply.PreviousValue = ""
+    }
+    kv.replyDic[v.CID] = v.Seq
+    kv.replyCache[v.CID] = *reply
     return *reply
+
   case HASH:
 
-    kv.logTail = kv.logTail+1
+    kv.logTail = kv.logTail + 1
     kv.px.Done(kv.logTail)
-
     reply := &PutReply{}
 
-    if kv.correctGroup(v.Key){
-      prevStr, ok := kv.kvDB[v.Key]
-      if ok {
-        kv.kvDB[v.Key] = concatHash(prevStr, v.Value)
-        reply.PreviousValue = prevStr
-      }else{
-        kv.kvDB[v.Key] = concatHash("", v.Value)
-        reply.PreviousValue = ""
-      }
-      kv.replyDic[v.CID] = v.Seq
-      reply.Err = OK
-      kv.replyCache[v.CID] = *reply
-    }else{
+    if kv.gid != kv.curConfig.Shards[key2shard(v.Key)] {
       reply.Err = ErrWrongGroup
+      return *reply
     }
 
+    if prevStr, ok := kv.kvDB[v.Key]; ok {
+      kv.kvDB[v.Key] = concatHash(prevStr, v.Value)
+      reply.PreviousValue = prevStr
+    } else {
+      kv.kvDB[v.Key] = concatHash("", v.Value)
+      reply.PreviousValue = ""
+    }
+    reply.Err = OK
+    kv.replyDic[v.CID] = v.Seq
+    kv.replyCache[v.CID] = *reply
     return *reply
-  case RECONFIG:
 
+  case RECONFIG:
+	// After a server has moved to a new view, it can leave the shards that it is not owning in the new view undeleted.
+	// If a kvserver severs a new shard, it should fetch shardInfo from the server used to own it.
     preply := &PutReply{}
 
-    for i:=0; i < shardmaster.NShards; i++{
-      //only fetch shard that does not belong to itself before
-      if kv.curConfig.Shards[i] != kv.gid && v.Shards[i] == kv.gid{
-        if kv.curConfig.Shards[i] == 0{
+    for i:= 0; i < shardmaster.NShards; i++ {
+      if kv.gid != kv.curConfig.Shards[i] && kv.gid == v.Shards[i] {
+
+        if kv.curConfig.Shards[i] == 0 {
           continue
         }
-        args := &FetchArgs{}
-        args.ShardNum = i
-        args.ConfigNum = v.Num
+
+        // try each kvserver replica in the group which used to own the shard[i]
+        args := &FetchArgs{ShardNum: i, ConfigNum: v.Num}
         var reply FetchReply
         count := 0
         to := 10 * time.Millisecond
-        for true {
-
+        for {
           ok := call(kv.curConfig.Groups[kv.curConfig.Shards[i]][count % len(kv.curConfig.Groups)], "ShardKV.SendShardInfo", args, &reply)
           count ++
-          if ok && reply.Err == OK{
-            //need to update own db
-            kv.mergeDB(reply.ReplyCache, reply.KVDB, reply.ReplyDic)
+          if ok && reply.Err == OK {
+
+            // send database to kv and update replyDic and replyCache
+		    for k, v := range reply.KVDB {
+			  kv.kvDB[k] = v
+		    }
+
+		    for k, v := range reply.ReplyDic {
+			  if kv.replyDic[k] < v {
+				  kv.replyDic[k] = v
+				  kv.replyCache[k] = reply.ReplyCache[k]
+			  }
+		    }
+
             break
-          }else if reply.Err == ErrReconfigHolding{
-            DPrintf("target not ready! Abort!\n")
+
+          } else if reply.Err == ErrReconfigHolding {
             preply.Err = ErrReconfigHolding
             return *preply
-
           }
+
           time.Sleep(to)
           if to < 10 * time.Second {
             to *= 2
           }
-
         }
 
       }
     }
-    var c shardmaster.Config
-    kv.logTail = kv.logTail+1
+
+    kv.logTail = kv.logTail + 1
     kv.px.Done(kv.logTail)
-    c.Groups = v.Groups
-    c.Shards = v.Shards
-    c.Num = v.Num
-    kv.curConfig = c
-
-    //DPrintf("Server; %d %d, config successfully update to %s\n", kv.gid, kv.me, v.Num)
-
+    kv.curConfig = shardmaster.Config{Groups: v.Groups, Shards: v.Shards, Num: v.Num}
     return *preply
+
   default:
     return
-    DPrintf("SHOULD NOT PRINT DEFAULT\n")
   }
-  DPrintf("SHOULD NOT PRINT DEFAULT\n")
+
   return
 }
 
-func (kv *ShardKV) Reconfig(newConfig shardmaster.Config) bool{
+func (kv *ShardKV) Reconfig(newConfig shardmaster.Config) bool {
 
-  newReconfig := &Op{}
-  DPrintf("Server : %d : %d doing reconfig, New Config Num is: %d\n", kv.gid, kv.me, newConfig.Num)
-  newReconfig.Num = newConfig.Num
-  newReconfig.Shards = newConfig.Shards
-  newReconfig.Groups = newConfig.Groups
+  //use paxos to start newReconfig
+  newReconfig := Op{Num: newConfig.Num, Shards: newConfig.Shards, Groups: newConfig.Groups, Type: RECONFIG}
 
-  newReconfig.Type = RECONFIG
-
-
-  for true {
+  for {
     to := 10 * time.Millisecond
-    //kv.mu.Lock()
     tentativeSeq := kv.logTail + 1
-    //kv.mu.Unlock()
-    //DPrintf("Server : %s Reconfig \n", kv.me)
-    //tentativeSeq = kv.logTail + 1
-    //time.Sleep(50*time.Millisecond)
-
-    //check periodically
 
     for {
       time.Sleep(to)
@@ -325,136 +259,61 @@ func (kv *ShardKV) Reconfig(newConfig shardmaster.Config) bool{
       }
 
       decided, op := kv.px.Status(tentativeSeq)
-
       if decided {
-
-        op2, ok := op.(*Op)
-        //DPrintf("is ok to convert: %t", ok)
-        //DPrintf("Server.Put invoke status | return uid: %d , request uid: %d \n", op1.Uid, newPut.Uid)
-
-        DPrintf("Decided? %t", decided)
-        //if ok2 {DPrintf("Server.Put invoke status | return uid: %d , request uid: %d \n", newOp.Uid, newPut.Uid)}
-        if ok{
-          if op2.Type == RECONFIG{
-
-            if op2.Num == newConfig.Num{
-
-              temp := kv.catchUp(*op2)
-              if temp.Err == ErrReconfigHolding{
-                return false
-              }
-
-              return true
-            }
-            DPrintf("Weird thing happens 2... agreed RECONFIG Op with config num: %d\n", op2.Num)
-          }else{
-            //case has already been decided, therefore the kvpaxos replica need to catch up
-            kv.catchUp(*op2)
-            DPrintf("Test1\n")
-            //need to start next instance immediately, thus no sleep
-            //tentativeSeq += 1
-            //time.Sleep(to)
-            break
+        newOp := op.(Op)
+        if newOp.Type == RECONFIG && newOp.Num == newConfig.Num {
+          temp := kv.catchUp(newOp)
+          if temp.Err == ErrReconfigHolding {
+            return false
           }
-        }else{
-          op3, ok := op.(Op)
-          if ok{
-            if op3.Type == RECONFIG{
-              if op3.Num == newConfig.Num {
-
-                temp := kv.catchUp(op3)
-                if temp.Err == ErrReconfigHolding{
-                  return false
-                }
-                return true
-              }
-              DPrintf("Weird thing happens 1...agreed RECONFIG Op with config num: %d\n", op3.Num)
-            }else{
-              //case has already been decided, therefore the kvpaxos replica need to catch up
-              kv.catchUp(op3)
-              //need to start next instance immediately, thus no sleep
-              //tentativeSeq += 1
-              DPrintf("Test2\n")
-              break
-            }
-          }else{
-            DPrintf("Fatal Error: decided = true, but value = nil")
-          }
-
+           return true
+        } else {
+          kv.catchUp(newOp)
+          break
         }
-
       }
-
-      DPrintf("Do Reconfig again... \n")
     }
-
   }
-
-
   return false
-
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
   // Your code here.
   kv.mu.Lock()
   defer kv.mu.Unlock()
-  // Your code here.
-  newGet := &Op{}
-  newGet.Type = GET
-  newGet.Key = args.Key
-  newGet.CID = args.CID
-  newGet.Seq = args.Seq
-  //seq := kv.newSeq()
 
+  newGet := Op{Type: GET, Key: args.Key, CID: args.CID, Seq: args.Seq}
+
+  // catchup new operations if possible
   var tentativeSeq int
-  for true{
-
+  for {
     tentativeSeq = kv.logTail + 1
-
-
     decided, op := kv.px.Status(tentativeSeq)
     if decided {
-      op1, ok := op.(Op)
-      if ok{
-        if op1.CID == 0{DPrintf("1fatal error, uid == 0")}
-
-        temp := kv.catchUp(op1)
-        if op1.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-          reply.Err = ErrReconfigHolding
-          return nil
-        }
-      }else{
-        op2, ok2 := op.(*Op)
-        //DPrintf("uid: %d\n", op2.Uid)
-        if !ok2 {DPrintf("Fatal Error: not match to *op\n")}
-        if op2.CID == 0{DPrintf("fatal error, uid == 0")}
-        temp := kv.catchUp(*op2)
-        if op2.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-          reply.Err = ErrReconfigHolding
-          return nil
-        }
+      op1 := op.(Op)
+      temp := kv.catchUp(op1)
+      if op1.Type == RECONFIG && temp.Err == ErrReconfigHolding {
+        reply.Err = ErrReconfigHolding
+        return nil
       }
-
-    }else{break}
-
+    } else {
+      break
+    }
   }
 
-  isDup, dupV := kv.isDuplicate(newGet.CID,newGet.Seq)
-  if isDup{
+  // check duplicate
+  isDup, dupV := kv.isDuplicate(newGet.CID, newGet.Seq)
+  if isDup {
     reply.Err = dupV.Err
     reply.Value = dupV.PreviousValue
     return nil
   }
-  //asking for the status until
 
-  for true {
+  // use paxos to propose new op
+  for {
     to := 10 * time.Millisecond
-    //kv.mu.Lock()
     tentativeSeq = kv.logTail + 1
-    //kv.mu.Unlock()
 
-    //time.Sleep(20*time.Millisecond)
     for {
       time.Sleep(to)
       kv.px.Start(tentativeSeq, newGet)
@@ -464,55 +323,34 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
       }
 
       decided, op := kv.px.Status(tentativeSeq)
-
       if decided {
-        op2, ok := op.(*Op)
-        if ok{
-          //if op2.CID == 0{DPrintf("fatal error, uid == 0")}
-          if op2.CID == newGet.CID && op2.Seq == newGet.Seq{
-            //no need to catch up, simply return value
-            temp := kv.catchUp(*op2)
-            reply.Err = temp.Err
-            reply.Value = temp.PreviousValue
+        newOp := op.(Op)
+        if newOp.CID == newGet.CID && newOp.Seq == newGet.Seq {
+          temp := kv.catchUp(newOp)
+          reply.Err = temp.Err
+          reply.Value = temp.PreviousValue
+          return nil
+        } else {
+          temp := kv.catchUp(newOp)
+          if newOp.Type == RECONFIG && temp.Err == ErrReconfigHolding {
+            reply.Err = ErrReconfigHolding
             return nil
-          }else {
-            //case has already been decided, therefore the kvpaxos replica need to catch up
-            temp := kv.catchUp(*op2)
-            if op2.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-              reply.Err = ErrReconfigHolding
-              return nil
-            }
-
-            break
           }
-        }else{
-          op3, ok2 := op.(Op)
-          if !ok2 {DPrintf("Fatal Error: not match to *op\n")}
-          //if op3.Uid == 0{DPrintf("fatal error, uid == 0")}
-          if op3.CID == newGet.CID && op3.Seq == newGet.Seq{
-            //no need to catch up, simply return value
-            temp := kv.catchUp(op3)
-            reply.Err = temp.Err
-            reply.Value = temp.PreviousValue
-            return nil
-          }else {
-            //case has already been decided, therefore the kvpaxos replica need to catch up
-            temp := kv.catchUp(op3)
-            if op3.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-              reply.Err = ErrReconfigHolding
-              return nil
-            }
-
-            break
-          }
+          break
         }
       }
-
     }
-
   }
-
   return nil
+}
+
+func (kv *ShardKV) isDuplicate(cid int64, seq int) (bool, PutReply) {
+  v, ok := kv.replyDic[cid]
+  var reply PutReply
+  if ok && v == seq {
+    return true, kv.replyCache[cid]
+  }
+  return false, reply
 }
 
 func (kv *ShardKV) Put(args *PutArgs, reply *PutReply) error {
@@ -520,78 +358,42 @@ func (kv *ShardKV) Put(args *PutArgs, reply *PutReply) error {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
-  DPrintf("Received new put command, puthash: %t, key : %s, value: %s\n, cid: %d, seq: %d", args.DoHash,args.Key, args.Value, args.CID, args.Seq )
-
-  newPut := &Op{}
-  if args.DoHash{
+  newPut := Op{Key: args.Key, CID: args.CID, Seq: args.Seq, Value: args.Value}
+  if args.DoHash {
     newPut.Type = HASH
-  }else{newPut.Type = PUT}
-
-
-  newPut.Key = args.Key
-  newPut.CID = args.CID
-  newPut.Seq = args.Seq
-  newPut.Value = args.Value
-  //newPut.DoHash = args.DoHash
-
-
-  var tentativeSeq int
-  //tentativeSeq = kv.logTail + 1
-  for true{
-    //kv.mu.Lock()
-    tentativeSeq = kv.logTail + 1
-
-    //kv.mu.Unlock()
-    decided, op := kv.px.Status(tentativeSeq)
-
-    if decided {
-      DPrintf("apply log into db...\n")
-      op1, ok := op.(Op)
-      if ok{
-        if op1.CID == 0{DPrintf("2fatal error, uid == 0")}
-        temp := kv.catchUp(op1)
-        if op1.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-          reply.Err = ErrReconfigHolding
-          return nil
-        }
-      }else{
-        op2, ok2 := op.(*Op)
-        DPrintf("uid: %d\n", op2.CID)
-        if !ok2 {DPrintf("Fatal Error: not match to *op\n")}
-        if op2.CID == 0{DPrintf("3fatal error, uid == 0")}
-        temp:=kv.catchUp(*op2)
-        if op2.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-          reply.Err = ErrReconfigHolding
-          return nil
-        }
-      }
-
-    }else{break}
-
+  } else {
+    newPut.Type = PUT
   }
-  DPrintf("Put | done catchup\n")
 
+  // catchup new operations if possible
+  var tentativeSeq int
+  for {
+    tentativeSeq = kv.logTail + 1
+    decided, op := kv.px.Status(tentativeSeq)
+    if decided {
+      newOp := op.(Op)
+      temp := kv.catchUp(newOp)
+      if newOp.Type == RECONFIG && temp.Err == ErrReconfigHolding {
+        reply.Err = ErrReconfigHolding
+        return nil
+      }
+    } else {
+      break
+    }
+  }
+
+  // check duplicate
   isDup, dupV := kv.isDuplicate(newPut.CID, newPut.Seq)
-  if isDup{
+  if isDup {
     reply.Err = dupV.Err
     reply.PreviousValue = dupV.PreviousValue
-    DPrintf("Put | is duplicate\n")
     return nil
   }
 
-  DPrintf("Put | done check duplicate\n")
-
-
-  for true {
+  // use paxos to propose new op
+  for {
     to := 10 * time.Millisecond
-    //kv.mu.Lock()
     tentativeSeq = kv.logTail + 1
-    //kv.mu.Unlock()
-    DPrintf("Server.Put | seq: %d, Key: %s, value: %s, dohash: %s\n", tentativeSeq, newPut.Key, newPut.Value, newPut.Type)
-    //tentativeSeq = kv.logTail + 1
-    //time.Sleep(50*time.Millisecond)
-
-    //check periodically
 
     for {
       time.Sleep(to)
@@ -605,66 +407,22 @@ func (kv *ShardKV) Put(args *PutArgs, reply *PutReply) error {
       decided, op := kv.px.Status(tentativeSeq)
 
       if decided {
-
-        op2, ok := op.(*Op)
-        //DPrintf("is ok to convert: %t", ok)
-        //DPrintf("Server.Put invoke status | return uid: %d , request uid: %d \n", op1.Uid, newPut.Uid)
-
-        DPrintf("Decided? %t", decided)
-        //if ok2 {DPrintf("Server.Put invoke status | return uid: %d , request uid: %d \n", newOp.Uid, newPut.Uid)}
-        if ok{
-          if op2.CID == newPut.CID && op2.Seq == newPut.Seq{
-
-            temp := kv.catchUp(*op2)
-            reply.Err = temp.Err
-            reply.PreviousValue  = temp.PreviousValue
-
+        newOp := op.(Op)
+        if newOp.CID == newPut.CID && newOp.Seq == newPut.Seq {
+          temp := kv.catchUp(newOp)
+          reply.Err = temp.Err
+          reply.PreviousValue = temp.PreviousValue
+          return nil
+        } else {
+          temp := kv.catchUp(newOp)
+          if newOp.Type == RECONFIG && temp.Err == ErrReconfigHolding {
+            reply.Err = ErrReconfigHolding
             return nil
-          }else{
-            //case has already been decided, therefore the kvpaxos replica need to catch up
-            temp := kv.catchUp(*op2)
-            if op2.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-              reply.Err = ErrReconfigHolding
-              return nil
-            }
-            //need to start next instance immediately, thus no sleep
-            //tentativeSeq += 1
-            //time.Sleep(to)
-            break
           }
-        }else{
-          op3, ok := op.(Op)
-          if ok{
-            if op3.CID == newPut.CID && op3.Seq == newPut.Seq{
-
-
-              temp := kv.catchUp(op3)
-              reply.Err = temp.Err
-              reply.PreviousValue = temp.PreviousValue
-
-              return nil
-            }else{
-              //case has already been decided, therefore the kvpaxos replica need to catch up
-              temp := kv.catchUp(op3)
-              if op3.Type == RECONFIG && temp.Err == ErrReconfigHolding{
-                reply.Err = ErrReconfigHolding
-                return nil
-              }
-              //need to start next instance immediately, thus no sleep
-              //tentativeSeq += 1
-              break
-            }
-          }else{
-            DPrintf("Fatal Error: decided = true, but value = nil")
-          }
-
+          break
         }
-
       }
-
-      DPrintf("Do put again... \n")
     }
-
   }
   return nil
 }
@@ -677,53 +435,36 @@ func (kv *ShardKV) tick() {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
+  // kv should catchUp operations,
+  // at the same time, it should check if newConfig.Num is not the same as the curConfig.Num
   var tentativeSeq int
-  //DPrintf("Group %d: me %d tick locked\n", kv.gid, kv.me)
   for {
     tentativeSeq = kv.logTail + 1
     decided, op := kv.px.Status(tentativeSeq)
     if decided {
-      op1, ok := op.(Op)
+      newOp, ok := op.(Op)
       if ok {
-        //if op1.CID == 0 {DPrintf("4fatal error, uid == 0")}
-        if op1.Type == RECONFIG {
+        if newOp.Type == RECONFIG {
           break
         }
-
-        kv.catchUp(op1)
-      }else{
-        op2 := op.(*Op)
-        //DPrintf("uid: %d\n", op2.Uid)
-        //if !ok2 {DPrintf("Fatal Error: not match to *op\n")}
-        //if op2.CID == 0 {DPrintf("fatal error, uid == 0")}
-        if op2.Type == RECONFIG {
-          break
-        }
-        kv.catchUp(*op2)
+        kv.catchUp(newOp)
       }
-
     } else {
       break
     }
   }
 
-  //DPrintf("Server: %d : %d, Tick\n", kv.gid, kv.me)
   newConfig := kv.sm.Query(-1)
 
   diff := newConfig.Num - kv.curConfig.Num
   for diff > 0 {
-
     config := kv.sm.Query(kv.curConfig.Num + 1)
-    //DPrintf("Server: %d : %d, new Config Num is : %s, and curConfig Num is: %s", kv.gid, kv.me, config.Num, kv.curConfig.Num)
-
-    temp := kv.Reconfig(config)
-    if !temp{
-      DPrintf("Tick() return first, bkz not ready\n")
+    ok := kv.Reconfig(config)
+    if !ok {
       return
     }
     diff --
   }
-  DPrintf("Group %d: me %d tick() Unlocked\n", kv.gid, kv.me)
   return
 }
 

@@ -60,8 +60,8 @@ type FetchArgs struct{
 
 type FetchReply struct{
   Err Err
-  ReplyDic map[int64]int  //cid : seq
-  ReplyCache map[int64]PutReply //will use putreply for now, however, it can also be getreply
+  ReplyDic map[int64]int
+  ReplyCache map[int64]PutReply
   KVDB map[string]string
 }
 

@@ -119,7 +119,6 @@ func (ck *Clerk) Get(key string) string {
 
         if ok && reply.Err == ErrReconfigHolding{
           time.Sleep(250 * time.Millisecond)
-          DPrintf("Wait for reconfig\n")
           break
         }
       }
@@ -164,9 +163,8 @@ func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
         if ok && (reply.Err == ErrWrongGroup) {
           break
         }
-        if ok && reply.Err == ErrReconfigHolding{
+        if ok && (reply.Err == ErrReconfigHolding) {
           time.Sleep(250 * time.Millisecond)
-          DPrintf("Wait for reconfig\n")
           break
         }
       }

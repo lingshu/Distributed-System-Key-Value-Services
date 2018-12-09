@@ -27,15 +27,7 @@ type ShardMaster struct {
   logTail int //the tail of the log, before which all have been performed in order onto state machine kvDB, initially -1
 }
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-  if Debug > 0 {
-    log.Printf(format, a...)
-  }
-  return
-}
-
 const Debug = 0
-
 
 type Op struct {
   // Your data here.
@@ -44,8 +36,6 @@ type Op struct {
   Shard int
   Num int
   Servers []string
-  //Uid int64
-
 }
 
 const (
@@ -79,6 +69,8 @@ func (sm *ShardMaster) Update(newShards [NShards]int64, newGroups map[int64][]st
 func (sm *ShardMaster) catchUp(v Op) bool {
   switch optype := v.Type; optype {
 
+  // when a new GID join in, the shardmaster should divide the shards as evenly as possible among the groups,
+  // and should move as few shards as possible to achieve that goal.
   case JOIN:
 
     if contains(sm.configs[sm.configNum].Shards, v.GID) {
